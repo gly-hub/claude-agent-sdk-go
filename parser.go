@@ -1,6 +1,9 @@
 package claudeagentsdk
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 func ParseMessage(data map[string]any) (Message, error) {
 	msgType, _ := data["type"].(string)
@@ -134,12 +137,13 @@ func ParseMessage(data map[string]any) (Message, error) {
 			Usage:             mapFromAny(data["usage"]),
 			Result:            stringFromAny(data["result"]),
 			StructuredOutput:  data["structured_output"],
-			ModelUsage:        mapFromAny(firstNonNil(data["modelUsage"], data["model_usage"])),
+			ModelUsage:        modelUsageFromAny(firstNonNil(data["modelUsage"], data["model_usage"])),
 			PermissionDenials: sliceFromAny(data["permission_denials"]),
 			DeferredToolUse:   deferred,
 			Errors:            stringSliceFromAny(data["errors"]),
 			APIErrorStatus:    intFromAny(data["api_error_status"]),
 			UUID:              stringFromAny(data["uuid"]),
+			TerminalReason:    stringFromAny(data["terminal_reason"]),
 		}, nil
 	case "stream_event":
 		return &StreamEvent{
@@ -239,6 +243,26 @@ func stringSliceFromAny(v any) []string {
 		}
 	}
 	return out
+}
+
+func modelUsageFromAny(v any) map[string]ModelUsage {
+	raw := mapFromAny(v)
+	if raw == nil {
+		return nil
+	}
+	usage := make(map[string]ModelUsage, len(raw))
+	for model, entry := range raw {
+		data, err := json.Marshal(entry)
+		if err != nil {
+			continue
+		}
+		var parsed ModelUsage
+		if err := json.Unmarshal(data, &parsed); err != nil {
+			continue
+		}
+		usage[model] = parsed
+	}
+	return usage
 }
 
 func boolFromAny(v any) bool {

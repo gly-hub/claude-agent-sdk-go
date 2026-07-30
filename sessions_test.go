@@ -89,3 +89,43 @@ func TestSessionLifecycle(t *testing.T) {
 		t.Fatalf("DeleteSession() error = %v", err)
 	}
 }
+
+func TestSubagentSessionMessages(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	projectDir := t.TempDir()
+	projectKey, err := ProjectKeyForDirectory(projectDir)
+	if err != nil {
+		t.Fatalf("ProjectKeyForDirectory() error = %v", err)
+	}
+	storageDir := filepath.Join(configDir, "projects", projectKey)
+	if err := os.MkdirAll(storageDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	agentID := "worker-1"
+	if err := os.WriteFile(filepath.Join(storageDir, sessionID+".jsonl"), []byte(`{"type":"user"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	subagentDir := filepath.Join(storageDir, sessionID, "subagents", "workflows", "run-1")
+	if err := os.MkdirAll(subagentDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	content := strings.Join([]string{
+		`{"type":"user","uuid":"11111111-1111-1111-1111-111111111111","sessionId":"550e8400-e29b-41d4-a716-446655440000","message":{"content":"delegate"}}`,
+		`{"type":"assistant","uuid":"22222222-2222-2222-2222-222222222222","parentUuid":"11111111-1111-1111-1111-111111111111","sessionId":"550e8400-e29b-41d4-a716-446655440000","message":{"content":"done"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(subagentDir, "agent-"+agentID+".jsonl"), []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	ids, err := ListSubagents(sessionID, projectDir)
+	if err != nil || len(ids) != 1 || ids[0] != agentID {
+		t.Fatalf("ListSubagents() = %#v, %v", ids, err)
+	}
+	messages, err := GetSubagentMessages(sessionID, agentID, projectDir, 0, 0)
+	if err != nil || len(messages) != 2 || messages[1].Type != "assistant" {
+		t.Fatalf("GetSubagentMessages() = %#v, %v", messages, err)
+	}
+}

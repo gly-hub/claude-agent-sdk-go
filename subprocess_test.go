@@ -110,6 +110,44 @@ func TestBuildCommandSupportsFlagStyleExtraArgs(t *testing.T) {
 	assertFlagValue(t, cmd, "--agent", "reviewer")
 }
 
+func TestBuildCommandBindsPotentiallyAmbiguousValues(t *testing.T) {
+	transport := NewSubprocessTransport(Options{
+		Resume:    "-resume-id",
+		SessionID: "-session-id",
+		ExtraArgs: map[string]ExtraArgValue{"agent": {Value: "-reviewer"}},
+	})
+
+	cmd := transport.buildCommand("/usr/local/bin/claude")
+	for _, expected := range []string{"--resume=-resume-id", "--session-id=-session-id", "--agent=-reviewer"} {
+		if !slices.Contains(cmd, expected) {
+			t.Fatalf("expected %q in command: %#v", expected, cmd)
+		}
+	}
+}
+
+func TestValidateWindowsCLIInputs(t *testing.T) {
+	if err := validateCLIPath("windows", `C:\\bin\\claude.cmd`); err == nil {
+		t.Fatal("expected batch CLI path to be rejected")
+	}
+	if err := validateCLIArguments("windows", "bad&value", "safe"); err == nil {
+		t.Fatal("expected unsafe resume value to be rejected")
+	}
+	if err := validateCLIArguments("windows", "safe", "safe"); err != nil {
+		t.Fatalf("expected safe Windows arguments to be accepted: %v", err)
+	}
+}
+
+func TestValidateCLIVersion(t *testing.T) {
+	for _, version := range []string{"latest", "stable", "2.1.220", "2.1.220-rc.1"} {
+		if _, err := validateCLIVersion(version); err != nil {
+			t.Fatalf("expected version %q to be valid: %v", version, err)
+		}
+	}
+	if _, err := validateCLIVersion("2.1.220; rm -rf"); err == nil {
+		t.Fatal("expected unsafe CLI version to be rejected")
+	}
+}
+
 func TestBuildCommandAddsNewPythonCompatibleFlags(t *testing.T) {
 	transport := NewSubprocessTransport(Options{
 		TaskBudget: &TaskBudget{Total: 1234},

@@ -35,15 +35,18 @@ func TestParseAssistantMessage(t *testing.T) {
 
 func TestParseResultMessageExtendedFields(t *testing.T) {
 	raw := map[string]any{
-		"type":               "result",
-		"subtype":            "success",
-		"session_id":         "sess-1",
-		"uuid":               "uuid-1",
-		"modelUsage":         map[string]any{"claude": float64(1)},
+		"type":       "result",
+		"subtype":    "success",
+		"session_id": "sess-1",
+		"uuid":       "uuid-1",
+		"modelUsage": map[string]any{"claude": map[string]any{
+			"inputTokens": float64(1), "outputTokens": float64(2), "canonicalModel": "claude-sonnet-4-5", "provider": "firstParty",
+		}},
 		"permission_denials": []any{map[string]any{"tool": "Bash"}},
 		"deferred_tool_use":  map[string]any{"id": "tool-1", "name": "Bash", "input": map[string]any{"command": "pwd"}},
 		"errors":             []any{"oops"},
 		"api_error_status":   float64(429),
+		"terminal_reason":    "completed",
 	}
 
 	msg, err := ParseMessage(raw)
@@ -60,8 +63,11 @@ func TestParseResultMessageExtendedFields(t *testing.T) {
 	if len(result.Errors) != 1 || result.Errors[0] != "oops" {
 		t.Fatalf("unexpected errors: %#v", result.Errors)
 	}
-	if len(result.PermissionDenials) != 1 || result.ModelUsage["claude"] != float64(1) {
+	if len(result.PermissionDenials) != 1 || result.ModelUsage["claude"].InputTokens != 1 || result.ModelUsage["claude"].CanonicalModel != "claude-sonnet-4-5" {
 		t.Fatalf("unexpected extended fields: %#v", result)
+	}
+	if result.TerminalReason != "completed" {
+		t.Fatalf("unexpected terminal reason: %#v", result)
 	}
 	if result.DeferredToolUse == nil || result.DeferredToolUse.Name != "Bash" {
 		t.Fatalf("unexpected deferred tool use: %#v", result.DeferredToolUse)

@@ -12,21 +12,27 @@ import (
 )
 
 type Client struct {
-	opts            Options
-	transport       Transport
-	msgCh           chan Message
-	errCh           chan error
-	done            chan struct{}
-	pendingMu       sync.Mutex
-	pending         map[string]chan controlResponse
-	hooksMu         sync.Mutex
-	hookCallbacks   map[string]HookCallback
-	nextHookID      uint64
-	requestCounter  uint64
-	lastResultError atomic.Value
-	materialized    *MaterializedResume
-	mirrorBatcher   *TranscriptMirrorBatcher
-	serverInfo      map[string]any
+	opts                    Options
+	transport               Transport
+	msgCh                   chan Message
+	errCh                   chan error
+	done                    chan struct{}
+	pendingMu               sync.Mutex
+	pending                 map[string]chan controlResponse
+	hooksMu                 sync.Mutex
+	hookCallbacks           map[string]HookCallback
+	inflightControlMu       sync.Mutex
+	inflightControlRequests map[string]context.CancelFunc
+	tasksMu                 sync.Mutex
+	inflightTasks           map[string]struct{}
+	queryComplete           chan struct{}
+	queryCompleteOnce       sync.Once
+	nextHookID              uint64
+	requestCounter          uint64
+	lastResultError         atomic.Value
+	materialized            *MaterializedResume
+	mirrorBatcher           *TranscriptMirrorBatcher
+	serverInfo              map[string]any
 }
 
 type controlResponse struct {
@@ -40,13 +46,16 @@ func NewClient(opts Options) *Client {
 
 func NewClientWithTransport(opts Options, transport Transport) *Client {
 	return &Client{
-		opts:          opts,
-		transport:     transport,
-		msgCh:         make(chan Message, 128),
-		errCh:         make(chan error, 1),
-		done:          make(chan struct{}),
-		pending:       map[string]chan controlResponse{},
-		hookCallbacks: map[string]HookCallback{},
+		opts:                    opts,
+		transport:               transport,
+		msgCh:                   make(chan Message, 128),
+		errCh:                   make(chan error, 1),
+		done:                    make(chan struct{}),
+		pending:                 map[string]chan controlResponse{},
+		hookCallbacks:           map[string]HookCallback{},
+		inflightControlRequests: map[string]context.CancelFunc{},
+		inflightTasks:           map[string]struct{}{},
+		queryComplete:           make(chan struct{}),
 	}
 }
 
@@ -299,6 +308,8 @@ func (c *Client) Close() error {
 	default:
 		close(c.done)
 	}
+	c.cancelInflightControlRequests()
+	c.completeQuery()
 	if c.mirrorBatcher != nil {
 		_ = c.mirrorBatcher.Flush()
 	}
@@ -311,6 +322,8 @@ func (c *Client) Close() error {
 
 func (c *Client) readLoop() {
 	defer func() {
+		c.cancelInflightControlRequests()
+		c.completeQuery()
 		c.failPending(fmt.Errorf("claude process stream closed before control response"))
 		close(c.msgCh)
 	}()
@@ -336,7 +349,10 @@ func (c *Client) readLoop() {
 			c.handleControlResponse(item.Data)
 			continue
 		case "control_request":
-			go c.handleControlRequest(item.Data)
+			c.startControlRequest(item.Data)
+			continue
+		case "control_cancel_request":
+			c.cancelControlRequest(stringFromAny(item.Data["request_id"]))
 			continue
 		case "transcript_mirror":
 			if c.mirrorBatcher != nil {
@@ -357,6 +373,9 @@ func (c *Client) readLoop() {
 				}
 			}
 			continue
+		}
+		if msgType == "system" {
+			c.trackTaskLifecycle(item.Data)
 		}
 
 		msg, err := ParseMessage(item.Data)
@@ -383,8 +402,54 @@ func (c *Client) readLoop() {
 		} else if msgType != "system" || stringFromAny(item.Data["subtype"]) != "session_state_changed" {
 			c.lastResultError.Store("")
 		}
+		if _, ok := msg.(*ResultMessage); ok && !c.hasInflightTasks() {
+			c.completeQuery()
+		}
 		c.msgCh <- msg
 	}
+}
+
+func (c *Client) startQueryInputClosure() {
+	go func() {
+		<-c.queryComplete
+		_ = c.EndInput()
+	}()
+}
+
+func (c *Client) completeQuery() {
+	c.queryCompleteOnce.Do(func() {
+		close(c.queryComplete)
+	})
+}
+
+func (c *Client) trackTaskLifecycle(data map[string]any) {
+	taskID := stringFromAny(data["task_id"])
+	if taskID == "" {
+		return
+	}
+
+	c.tasksMu.Lock()
+	defer c.tasksMu.Unlock()
+	switch stringFromAny(data["subtype"]) {
+	case "task_started":
+		taskType := stringFromAny(data["task_type"])
+		if taskType == "local_agent" || taskType == "local_workflow" {
+			c.inflightTasks[taskID] = struct{}{}
+		}
+	case "task_notification":
+		delete(c.inflightTasks, taskID)
+	case "task_updated":
+		patch := mapFromAny(data["patch"])
+		if _, terminal := TerminalTaskStatuses[stringFromAny(patch["status"])]; terminal {
+			delete(c.inflightTasks, taskID)
+		}
+	}
+}
+
+func (c *Client) hasInflightTasks() bool {
+	c.tasksMu.Lock()
+	defer c.tasksMu.Unlock()
+	return len(c.inflightTasks) > 0
 }
 
 func (c *Client) failPending(err error) {
@@ -417,7 +482,54 @@ func (c *Client) handleControlResponse(data map[string]any) {
 	waiter <- controlResponse{Response: mapFromAny(response["response"])}
 }
 
-func (c *Client) handleControlRequest(data map[string]any) {
+func (c *Client) startControlRequest(data map[string]any) {
+	requestID := stringFromAny(data["request_id"])
+	if requestID == "" {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c.inflightControlMu.Lock()
+	if previous := c.inflightControlRequests[requestID]; previous != nil {
+		previous()
+	}
+	c.inflightControlRequests[requestID] = cancel
+	c.inflightControlMu.Unlock()
+	go func() {
+		defer c.removeControlRequest(requestID)
+		c.handleControlRequest(ctx, data)
+	}()
+}
+
+func (c *Client) cancelControlRequest(requestID string) {
+	if requestID == "" {
+		return
+	}
+	c.inflightControlMu.Lock()
+	cancel := c.inflightControlRequests[requestID]
+	delete(c.inflightControlRequests, requestID)
+	c.inflightControlMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (c *Client) removeControlRequest(requestID string) {
+	c.inflightControlMu.Lock()
+	delete(c.inflightControlRequests, requestID)
+	c.inflightControlMu.Unlock()
+}
+
+func (c *Client) cancelInflightControlRequests() {
+	c.inflightControlMu.Lock()
+	pending := c.inflightControlRequests
+	c.inflightControlRequests = map[string]context.CancelFunc{}
+	c.inflightControlMu.Unlock()
+	for _, cancel := range pending {
+		cancel()
+	}
+}
+
+func (c *Client) handleControlRequest(ctx context.Context, data map[string]any) {
 	requestID := stringFromAny(data["request_id"])
 	request := mapFromAny(data["request"])
 	subtype := stringFromAny(request["subtype"])
@@ -427,13 +539,16 @@ func (c *Client) handleControlRequest(data map[string]any) {
 
 	switch subtype {
 	case "can_use_tool":
-		responsePayload, err = c.handleCanUseTool(request)
+		responsePayload, err = c.handleCanUseTool(ctx, request)
 	case "hook_callback":
-		responsePayload, err = c.handleHookCallback(request)
+		responsePayload, err = c.handleHookCallback(ctx, request)
 	case "mcp_message":
 		responsePayload, err = c.handleMCPMessage(request)
 	default:
 		err = fmt.Errorf("unsupported control request subtype: %s", subtype)
+	}
+	if ctx.Err() != nil {
+		return
 	}
 
 	payload := map[string]any{
@@ -449,10 +564,10 @@ func (c *Client) handleControlRequest(data map[string]any) {
 		payload["response"].(map[string]any)["subtype"] = "success"
 		payload["response"].(map[string]any)["response"] = responsePayload
 	}
-	_ = c.writeJSON(context.Background(), payload)
+	_ = c.writeJSON(ctx, payload)
 }
 
-func (c *Client) handleCanUseTool(request map[string]any) (map[string]any, error) {
+func (c *Client) handleCanUseTool(ctx context.Context, request map[string]any) (map[string]any, error) {
 	if c.opts.CanUseTool == nil {
 		return nil, fmt.Errorf("can use tool callback is not configured")
 	}
@@ -477,6 +592,11 @@ func (c *Client) handleCanUseTool(request map[string]any) (map[string]any, error
 		Title:                 stringFromAny(request["title"]),
 		DisplayName:           stringFromAny(request["display_name"]),
 		Description:           stringFromAny(request["description"]),
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
 	}
 	decision, err := c.opts.CanUseTool(req)
 	if err != nil {
@@ -504,7 +624,7 @@ func (c *Client) handleCanUseTool(request map[string]any) (map[string]any, error
 	return response, nil
 }
 
-func (c *Client) handleHookCallback(request map[string]any) (map[string]any, error) {
+func (c *Client) handleHookCallback(ctx context.Context, request map[string]any) (map[string]any, error) {
 	callbackID := stringFromAny(request["callback_id"])
 	c.hooksMu.Lock()
 	callback := c.hookCallbacks[callbackID]
@@ -516,7 +636,7 @@ func (c *Client) handleHookCallback(request map[string]any) (map[string]any, err
 	output, err := callback(
 		mapFromAny(request["input"]),
 		stringFromAny(request["tool_use_id"]),
-		HookContext{Signal: nil},
+		HookContext{Signal: ctx.Done()},
 	)
 	if err != nil {
 		return nil, err
@@ -605,11 +725,17 @@ func (c *Client) removePending(requestID string) {
 }
 
 func (c *Client) writeJSON(ctx context.Context, payload map[string]any) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 	data = append(data, '\n')
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return c.transport.Write(ctx, data)
 }
 

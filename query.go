@@ -48,14 +48,12 @@ func queryWithClient(ctx context.Context, prompt string, opts Options, client *C
 		_ = client.Close()
 		return nil, err
 	}
+	client.startQueryInputClosure()
 	return &MessageStream{client: client}, nil
 }
 
 func (s *MessageStream) Next(ctx context.Context) (Message, error) {
 	msg, err := s.client.Next(ctx)
-	if _, ok := msg.(*ResultMessage); ok {
-		_ = s.client.EndInput()
-	}
 	if err == io.EOF {
 		_ = s.client.Close()
 	}
@@ -64,11 +62,6 @@ func (s *MessageStream) Next(ctx context.Context) (Message, error) {
 
 func (s *MessageStream) ReceiveResponse(ctx context.Context) ([]Message, error) {
 	messages, err := s.client.ReceiveResponse(ctx)
-	if len(messages) > 0 {
-		if _, ok := messages[len(messages)-1].(*ResultMessage); ok {
-			_ = s.client.EndInput()
-		}
-	}
 	if err == io.EOF {
 		_ = s.client.Close()
 	}
@@ -83,7 +76,6 @@ func (s *MessageStream) ReceiveResponseStream(ctx context.Context) <-chan Messag
 		for msg := range inner {
 			out <- msg
 			if _, ok := msg.(*ResultMessage); ok {
-				_ = s.client.EndInput()
 				return
 			}
 		}
