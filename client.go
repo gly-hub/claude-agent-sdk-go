@@ -54,6 +54,9 @@ func (c *Client) Connect(ctx context.Context) error {
 	if err := validateSessionStoreOptions(c.opts); err != nil {
 		return err
 	}
+	if err := validatePermissionPromptOptions(c.opts); err != nil {
+		return err
+	}
 	if c.opts.LoadTimeoutMS == 0 {
 		c.opts.LoadTimeoutMS = 60000
 	}
@@ -94,6 +97,9 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 	if hooks := c.buildHooksConfig(); len(hooks) > 0 {
 		request["hooks"] = hooks
+	}
+	if c.opts.SystemPromptPreset != nil && c.opts.SystemPromptPreset.ExcludeDynamicSections {
+		request["excludeDynamicSections"] = true
 	}
 	if len(c.opts.Agents) > 0 {
 		request["agents"] = c.opts.Agents
@@ -216,8 +222,32 @@ func (c *Client) GetMCPStatus(ctx context.Context) (map[string]any, error) {
 	return c.sendControlRequest(ctx, map[string]any{"subtype": "mcp_status"}, 30*time.Second)
 }
 
+func (c *Client) GetMCPStatusResponse(ctx context.Context) (*MCPStatusResponse, error) {
+	raw, err := c.GetMCPStatus(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var response MCPStatusResponse
+	if err := decodeMap(raw, &response); err != nil {
+		return nil, err
+	}
+	return &response, nil
+}
+
 func (c *Client) GetContextUsage(ctx context.Context) (map[string]any, error) {
 	return c.sendControlRequest(ctx, map[string]any{"subtype": "get_context_usage"}, 30*time.Second)
+}
+
+func (c *Client) GetContextUsageResponse(ctx context.Context) (*ContextUsageResponse, error) {
+	raw, err := c.GetContextUsage(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var response ContextUsageResponse
+	if err := decodeMap(raw, &response); err != nil {
+		return nil, err
+	}
+	return &response, nil
 }
 
 func (c *Client) GetServerInfo() map[string]any {
@@ -245,6 +275,24 @@ func (c *Client) ReceiveResponse(ctx context.Context) ([]Message, error) {
 	}
 }
 
+func (c *Client) ReceiveResponseStream(ctx context.Context) <-chan Message {
+	out := make(chan Message)
+	go func() {
+		defer close(out)
+		for {
+			msg, err := c.Next(ctx)
+			if err != nil {
+				return
+			}
+			out <- msg
+			if _, ok := msg.(*ResultMessage); ok {
+				return
+			}
+		}
+	}()
+	return out
+}
+
 func (c *Client) Close() error {
 	select {
 	case <-c.done:
@@ -262,11 +310,21 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) readLoop() {
-	defer close(c.msgCh)
+	defer func() {
+		c.failPending(fmt.Errorf("claude process stream closed before control response"))
+		close(c.msgCh)
+	}()
 	for item := range c.transport.ReadMessages() {
 		if item.Err != nil {
+			err := item.Err
+			if _, ok := err.(*ProcessError); ok {
+				if last, _ := c.lastResultError.Load().(string); last != "" {
+					err = fmt.Errorf("Claude Code returned an error result: %s", last)
+				}
+			}
+			c.failPending(err)
 			select {
-			case c.errCh <- item.Err:
+			case c.errCh <- err:
 			default:
 			}
 			return
@@ -290,6 +348,7 @@ func (c *Client) readLoop() {
 					}
 				}
 				if err := c.mirrorBatcher.Enqueue(stringFromAny(item.Data["filePath"]), entries); err != nil {
+					c.failPending(err)
 					select {
 					case c.errCh <- err:
 					default:
@@ -302,11 +361,15 @@ func (c *Client) readLoop() {
 
 		msg, err := ParseMessage(item.Data)
 		if err != nil {
+			c.failPending(err)
 			select {
 			case c.errCh <- err:
 			default:
 			}
 			return
+		}
+		if msg == nil {
+			continue
 		}
 		if result, ok := msg.(*ResultMessage); ok && result.IsError && result.Result != "" {
 			c.lastResultError.Store(result.Result)
@@ -321,6 +384,19 @@ func (c *Client) readLoop() {
 			c.lastResultError.Store("")
 		}
 		c.msgCh <- msg
+	}
+}
+
+func (c *Client) failPending(err error) {
+	if err == nil {
+		return
+	}
+	c.pendingMu.Lock()
+	pending := c.pending
+	c.pending = map[string]chan controlResponse{}
+	c.pendingMu.Unlock()
+	for _, waiter := range pending {
+		waiter <- controlResponse{Err: err}
 	}
 }
 
@@ -500,6 +576,7 @@ func (c *Client) sendControlRequest(ctx context.Context, request map[string]any,
 		"request":    request,
 	}
 	if err := c.writeJSON(ctx, payload); err != nil {
+		c.removePending(requestID)
 		return nil, err
 	}
 
@@ -508,12 +585,23 @@ func (c *Client) sendControlRequest(ctx context.Context, request map[string]any,
 
 	select {
 	case <-ctx.Done():
+		c.removePending(requestID)
 		return nil, ctx.Err()
 	case <-timer.C:
+		c.removePending(requestID)
 		return nil, fmt.Errorf("control request timeout: %s", stringFromAny(request["subtype"]))
+	case err := <-c.errCh:
+		c.removePending(requestID)
+		return nil, err
 	case res := <-waiter:
 		return res.Response, res.Err
 	}
+}
+
+func (c *Client) removePending(requestID string) {
+	c.pendingMu.Lock()
+	delete(c.pending, requestID)
+	c.pendingMu.Unlock()
 }
 
 func (c *Client) writeJSON(ctx context.Context, payload map[string]any) error {
@@ -526,11 +614,16 @@ func (c *Client) writeJSON(ctx context.Context, payload map[string]any) error {
 }
 
 func (c *Client) initializeSkills() any {
-	if c.opts.EnableAllSkills {
+	switch skills := c.opts.Skills.(type) {
+	case nil:
 		return nil
-	}
-	if len(c.opts.Skills) > 0 {
-		return c.opts.Skills
+	case string:
+		if skills == "all" {
+			return nil
+		}
+		return nil
+	case []string:
+		return skills
 	}
 	return nil
 }
@@ -605,4 +698,12 @@ func toJSONDebug(v any) string {
 		return fmt.Sprintf("%#v", v)
 	}
 	return string(data)
+}
+
+func decodeMap(src map[string]any, dst any) error {
+	data, err := json.Marshal(src)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, dst)
 }

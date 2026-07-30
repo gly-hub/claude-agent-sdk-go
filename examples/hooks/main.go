@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"io"
 	"log"
 	"strings"
 
@@ -47,17 +46,6 @@ func main() {
 	if err := client.SendUser(ctx, "Run: echo hello", "default"); err != nil {
 		log.Fatal(err)
 	}
-	if err := client.EndInput(); err != nil {
-		log.Fatal(err)
-	}
-
-	for {
-		_, err := client.Next(ctx)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			log.Fatal(err)
-		}
+	for range client.ReceiveResponseStream(ctx) {
 	}
 }
