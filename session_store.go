@@ -180,8 +180,11 @@ func MaterializeResumeSession(opts Options) (*MaterializedResume, error) {
 	}
 	_ = copyAuthFiles(tmpBase, opts.Env)
 
-	subkeys, err := opts.SessionStore.ListSubkeys(SessionListSubkeysKey{ProjectKey: projectKey, SessionID: sessionID})
-	if err == nil {
+	if subkeyStore, ok := opts.SessionStore.(SessionSubkeyStore); ok {
+		subkeys, err := subkeyStore.ListSubkeys(SessionListSubkeysKey{ProjectKey: projectKey, SessionID: sessionID})
+		if err != nil {
+			subkeys = nil
+		}
 		for _, subpath := range subkeys {
 			if subpath == "" || strings.Contains(subpath, "..") || filepath.IsAbs(subpath) {
 				continue
@@ -319,7 +322,11 @@ func loadStoreCandidate(store SessionStore, projectKey string, sessionID string,
 }
 
 func resolveContinueCandidate(store SessionStore, projectKey string, timeout time.Duration) (string, []SessionStoreEntry, error) {
-	list, err := store.ListSessions(projectKey)
+	listStore, ok := store.(SessionListStore)
+	if !ok {
+		return "", nil, fmt.Errorf("session store does not implement ListSessions; ContinueConversation requires SessionListStore")
+	}
+	list, err := listStore.ListSessions(projectKey)
 	if err != nil {
 		return "", nil, err
 	}

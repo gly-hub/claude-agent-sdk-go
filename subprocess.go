@@ -39,6 +39,7 @@ type SubprocessTransport struct {
 	processMu   sync.Mutex
 	processDone chan struct{}
 	processErr  error
+	stderrDone  chan struct{}
 	stderrBuf   bytes.Buffer
 }
 
@@ -47,6 +48,7 @@ func NewSubprocessTransport(opts Options) *SubprocessTransport {
 		opts:        opts,
 		msgCh:       make(chan transportMessage, 128),
 		processDone: make(chan struct{}),
+		stderrDone:  make(chan struct{}),
 	}
 }
 
@@ -117,11 +119,14 @@ func (t *SubprocessTransport) Connect(ctx context.Context) error {
 	t.stderr = stderr
 	t.processDone = make(chan struct{})
 	t.processErr = nil
+	t.stderrDone = make(chan struct{})
 	t.ready = true
 
 	go t.readStdout()
 	if stderr != nil {
 		go t.readStderr()
+	} else {
+		close(t.stderrDone)
 	}
 	go t.waitProcess()
 	return nil
@@ -659,12 +664,16 @@ func (t *SubprocessTransport) effectivePermissionPromptTool() string {
 }
 
 func (t *SubprocessTransport) effectiveAllowedTools() []string {
-	allowed := append([]string{}, t.opts.AllowedTools...)
+	return effectiveAllowedTools(t.opts)
+}
+
+func effectiveAllowedTools(opts Options) []string {
+	allowed := append([]string{}, opts.AllowedTools...)
 	seen := map[string]struct{}{}
 	for _, tool := range allowed {
 		seen[tool] = struct{}{}
 	}
-	switch skills := t.opts.Skills.(type) {
+	switch skills := opts.Skills.(type) {
 	case string:
 		if skills == "all" {
 			if _, ok := seen["Skill"]; !ok {
@@ -683,6 +692,59 @@ func (t *SubprocessTransport) effectiveAllowedTools() []string {
 		}
 	}
 	return allowed
+}
+
+func canUseToolShadowedWarning(opts Options) string {
+	if opts.CanUseTool == nil {
+		return ""
+	}
+	if opts.PermissionMode == PermissionModeBypassPermissions {
+		return "CanUseTool will not be invoked: PermissionModeBypassPermissions auto-approves every tool call (except explicit deny rules) before the callback is consulted. To gate every tool call, use a PreToolUse hook instead."
+	}
+
+	shadowed := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, entry := range effectiveAllowedTools(opts) {
+		tool := wholeToolAllowed(entry)
+		if tool == "" {
+			continue
+		}
+		if _, exists := seen[tool]; exists {
+			continue
+		}
+		seen[tool] = struct{}{}
+		shadowed = append(shadowed, tool)
+	}
+	if len(shadowed) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("CanUseTool will not be invoked for: %s. An AllowedTools entry that allows a whole tool auto-approves it before the callback is consulted. To gate every tool call, use a PreToolUse hook; or narrow the entry so calls fall through to CanUseTool. Allow rules from settings files can also shadow the callback but are not visible here.", strings.Join(shadowed, ", "))
+}
+
+func wholeToolAllowed(entry string) string {
+	entry = strings.TrimSpace(entry)
+	if entry == "" {
+		return ""
+	}
+	open := strings.IndexByte(entry, '(')
+	if open < 0 {
+		return entry
+	}
+	if open == 0 || !strings.HasSuffix(entry, ")") {
+		return ""
+	}
+	if specifier := entry[open+1 : len(entry)-1]; specifier == "" || specifier == "*" {
+		return entry[:open]
+	}
+	return ""
+}
+
+func callWarningCallback(callback func(string), warning string) {
+	defer func() {
+		// Diagnostics must not prevent the client from connecting.
+		_ = recover()
+	}()
+	callback(warning)
 }
 
 func (t *SubprocessTransport) effectiveSettingSources() []string {
@@ -765,41 +827,43 @@ func (t *SubprocessTransport) readStdout() {
 	defer close(t.msgCh)
 
 	reader := bufio.NewReader(t.stdout)
-	var jsonBuffer []byte
+	framer := ndjsonFramer{}
+	chunk := make([]byte, 32*1024)
 	for {
-		line, err := reader.ReadBytes('\n')
-		if len(bytes.TrimSpace(line)) > 0 {
-			chunk := bytes.TrimSpace(line)
-			if len(jsonBuffer) == 0 && !bytes.HasPrefix(chunk, []byte("{")) {
-				if err != nil && !errors.Is(err, io.EOF) {
-					t.msgCh <- transportMessage{Err: err}
+		n, err := reader.Read(chunk)
+		if n > 0 {
+			for _, line := range framer.Push(chunk[:n]) {
+				if len(line) > t.effectiveMaxBufferSize() {
+					t.msgCh <- transportMessage{Err: fmt.Errorf("json message exceeded maximum buffer size of %d bytes", t.effectiveMaxBufferSize())}
 					return
 				}
-				if err == nil {
-					continue
+				payload, parseErr := parseNDJSONLine(line)
+				if parseErr != nil {
+					t.msgCh <- transportMessage{Err: parseErr}
+					return
+				}
+				if payload != nil {
+					t.msgCh <- transportMessage{Data: payload}
 				}
 			}
-			jsonBuffer = append(jsonBuffer, chunk...)
-			maxBufferSize := t.effectiveMaxBufferSize()
-			if len(jsonBuffer) > maxBufferSize {
-				t.msgCh <- transportMessage{Err: fmt.Errorf("json message exceeded maximum buffer size of %d bytes", maxBufferSize)}
+			if framer.PendingLen() > t.effectiveMaxBufferSize() {
+				t.msgCh <- transportMessage{Err: fmt.Errorf("json message exceeded maximum buffer size of %d bytes", t.effectiveMaxBufferSize())}
 				return
 			}
-			var payload map[string]any
-			if unmarshalErr := json.Unmarshal(jsonBuffer, &payload); unmarshalErr != nil {
-				if err == nil {
-					continue
-				}
-				t.msgCh <- transportMessage{Err: unmarshalErr}
-				return
-			}
-			t.msgCh <- transportMessage{Data: payload}
-			jsonBuffer = jsonBuffer[:0]
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
 				t.msgCh <- transportMessage{Err: err}
 				return
+			}
+			if tail := framer.Flush(); len(tail) > 0 {
+				if len(tail) > t.effectiveMaxBufferSize() {
+					t.msgCh <- transportMessage{Err: fmt.Errorf("json message exceeded maximum buffer size of %d bytes", t.effectiveMaxBufferSize())}
+					return
+				}
+				if payload, parseErr := parseNDJSONLine(tail); parseErr == nil && payload != nil {
+					t.msgCh <- transportMessage{Data: payload}
+				}
 			}
 			if processErr := t.waitForProcessErr(); processErr != nil {
 				t.msgCh <- transportMessage{Err: t.processError(processErr)}
@@ -807,6 +871,48 @@ func (t *SubprocessTransport) readStdout() {
 			return
 		}
 	}
+}
+
+// ndjsonFramer reconstructs lines from arbitrary process stdout chunks.
+// Chunks must not be trimmed: a boundary can fall inside a JSON string.
+type ndjsonFramer struct {
+	pending []byte
+}
+
+func (f *ndjsonFramer) Push(chunk []byte) [][]byte {
+	f.pending = append(f.pending, chunk...)
+	lines := make([][]byte, 0)
+	for {
+		index := bytes.IndexByte(f.pending, '\n')
+		if index < 0 {
+			return lines
+		}
+		line := append([]byte(nil), f.pending[:index]...)
+		lines = append(lines, line)
+		f.pending = f.pending[index+1:]
+	}
+}
+
+func (f *ndjsonFramer) PendingLen() int {
+	return len(f.pending)
+}
+
+func (f *ndjsonFramer) Flush() []byte {
+	tail := f.pending
+	f.pending = nil
+	return tail
+}
+
+func parseNDJSONLine(line []byte) (map[string]any, error) {
+	line = bytes.TrimSpace(line)
+	if len(line) == 0 || !bytes.HasPrefix(line, []byte("{")) {
+		return nil, nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(line, &payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
 }
 
 func (t *SubprocessTransport) effectiveMaxBufferSize() int {
@@ -817,19 +923,50 @@ func (t *SubprocessTransport) effectiveMaxBufferSize() int {
 }
 
 func (t *SubprocessTransport) readStderr() {
-	reader := bufio.NewScanner(t.stderr)
-	for reader.Scan() {
-		line := reader.Text()
-		t.stderrBuf.WriteString(line)
-		t.stderrBuf.WriteByte('\n')
-		if t.opts.Stderr != nil {
-			t.opts.Stderr(line)
+	defer close(t.stderrDone)
+
+	reader := bufio.NewReader(t.stderr)
+	framer := ndjsonFramer{}
+	chunk := make([]byte, 32*1024)
+	for {
+		n, err := reader.Read(chunk)
+		if n > 0 {
+			for _, line := range framer.Push(chunk[:n]) {
+				t.consumeStderrLine(string(line))
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				if tail := framer.Flush(); len(tail) > 0 {
+					t.consumeStderrLine(string(tail))
+				}
+			}
+			return
 		}
 	}
 }
 
+func (t *SubprocessTransport) consumeStderrLine(line string) {
+	t.stderrBuf.WriteString(line)
+	t.stderrBuf.WriteByte('\n')
+	if t.opts.Stderr != nil {
+		callStderrCallback(t.opts.Stderr, line)
+	}
+}
+
+func callStderrCallback(callback func(string), line string) {
+	defer func() {
+		// Stderr callbacks are observational and must not interrupt transport cleanup.
+		_ = recover()
+	}()
+	callback(line)
+}
+
 func (t *SubprocessTransport) waitProcess() {
 	err := t.cmd.Wait()
+	if t.stderrDone != nil {
+		<-t.stderrDone
+	}
 	t.processMu.Lock()
 	t.processErr = err
 	t.ready = false

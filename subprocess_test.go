@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"testing"
 
 	"go.opentelemetry.io/otel"
@@ -191,6 +192,47 @@ func TestValidatePermissionPromptOptionsRejectsConflict(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected CanUseTool and custom PermissionPromptTool conflict")
+	}
+}
+
+func TestCanUseToolShadowedWarning(t *testing.T) {
+	callback := func(ToolPermissionRequest) (PermissionDecision, error) {
+		return PermissionDecision{Behavior: "allow"}, nil
+	}
+	for _, tc := range []struct {
+		name string
+		opts Options
+		want string
+	}{
+		{
+			name: "bypass permissions",
+			opts: Options{CanUseTool: callback, PermissionMode: PermissionModeBypassPermissions},
+			want: "PermissionModeBypassPermissions",
+		},
+		{
+			name: "whole tools are deduplicated",
+			opts: Options{CanUseTool: callback, AllowedTools: []string{"Read", "Read()", "Bash(*)", "Edit(file)"}},
+			want: "Read, Bash",
+		},
+		{
+			name: "all skills add bare skill",
+			opts: Options{CanUseTool: callback, Skills: "all"},
+			want: "Skill",
+		},
+		{
+			name: "narrow rules do not shadow",
+			opts: Options{CanUseTool: callback, AllowedTools: []string{"Read(file:*)"}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := canUseToolShadowedWarning(tc.opts)
+			if tc.want == "" && got != "" {
+				t.Fatalf("expected no warning, got %q", got)
+			}
+			if tc.want != "" && !strings.Contains(got, tc.want) {
+				t.Fatalf("expected warning containing %q, got %q", tc.want, got)
+			}
+		})
 	}
 }
 
@@ -435,6 +477,122 @@ func TestReadStdoutAccumulatesPartialJSONAndSkipsNoise(t *testing.T) {
 	if msg.Data["type"] != "system" || msg.Data["subtype"] != "ready" {
 		t.Fatalf("unexpected message: %#v", msg.Data)
 	}
+}
+
+func TestNDJSONFramerPreservesWhitespaceAcrossChunkBoundaries(t *testing.T) {
+	framer := ndjsonFramer{}
+	if lines := framer.Push([]byte(`{"value":"one `)); len(lines) != 0 {
+		t.Fatalf("unexpected complete lines: %#v", lines)
+	}
+	lines := framer.Push([]byte(` two"}` + "\n"))
+	if len(lines) != 1 {
+		t.Fatalf("expected one complete line, got %#v", lines)
+	}
+	payload, err := parseNDJSONLine(lines[0])
+	if err != nil || payload["value"] != "one  two" {
+		t.Fatalf("parseNDJSONLine() = %#v, %v", payload, err)
+	}
+}
+
+func TestReadStdoutAcceptsLineLargerThanReaderBuffer(t *testing.T) {
+	stdout, writer := io.Pipe()
+	transport := NewSubprocessTransport(Options{})
+	transport.stdout = stdout
+	transport.processDone = make(chan struct{})
+	go transport.readStdout()
+	close(transport.processDone)
+
+	largeText := strings.Repeat("x", 96*1024)
+	go func() {
+		_, _ = writer.Write([]byte(`{"type":"system","text":"` + largeText + `"}` + "\n"))
+		_ = writer.Close()
+	}()
+
+	msg, ok := <-transport.ReadMessages()
+	if !ok || msg.Err != nil {
+		t.Fatalf("expected large JSON message, got %#v (open=%t)", msg, ok)
+	}
+	if got := len(stringFromAny(msg.Data["text"])); got != len(largeText) {
+		t.Fatalf("unexpected text length: got %d, want %d", got, len(largeText))
+	}
+}
+
+func TestReadStdoutRejectsOversizedPendingLine(t *testing.T) {
+	stdout, writer := io.Pipe()
+	transport := NewSubprocessTransport(Options{MaxBufferSize: 32})
+	transport.stdout = stdout
+	transport.processDone = make(chan struct{})
+	go transport.readStdout()
+	close(transport.processDone)
+
+	go func() {
+		_, _ = writer.Write([]byte(`{"type":"system","text":"this is too large"}`))
+		_ = writer.Close()
+	}()
+
+	msg, ok := <-transport.ReadMessages()
+	if !ok || msg.Err == nil || !strings.Contains(msg.Err.Error(), "maximum buffer size") {
+		t.Fatalf("expected maximum buffer size error, got %#v (open=%t)", msg, ok)
+	}
+}
+
+func TestReadStderrAcceptsLargeFinalLine(t *testing.T) {
+	stderr, writer := io.Pipe()
+	var lines []string
+	transport := NewSubprocessTransport(Options{Stderr: func(line string) {
+		lines = append(lines, line)
+	}})
+	transport.stderr = stderr
+	transport.stderrDone = make(chan struct{})
+	go transport.readStderr()
+
+	largeLine := strings.Repeat("x", 96*1024)
+	go func() {
+		_, _ = writer.Write([]byte(largeLine))
+		_ = writer.Close()
+	}()
+	<-transport.stderrDone
+
+	if len(lines) != 1 || lines[0] != largeLine {
+		t.Fatalf("unexpected stderr callbacks: %d lines, length %d", len(lines), len(firstOrEmpty(lines)))
+	}
+	if got := strings.TrimSpace(transport.stderrBuf.String()); got != largeLine {
+		t.Fatalf("unexpected buffered stderr length: got %d, want %d", len(got), len(largeLine))
+	}
+}
+
+func TestReadStderrRecoversCallbackPanic(t *testing.T) {
+	stderr, writer := io.Pipe()
+	var lines []string
+	transport := NewSubprocessTransport(Options{Stderr: func(line string) {
+		if line == "first" {
+			panic("callback failure")
+		}
+		lines = append(lines, line)
+	}})
+	transport.stderr = stderr
+	transport.stderrDone = make(chan struct{})
+	go transport.readStderr()
+
+	go func() {
+		_, _ = writer.Write([]byte("first\nsecond\n"))
+		_ = writer.Close()
+	}()
+	<-transport.stderrDone
+
+	if len(lines) != 1 || lines[0] != "second" {
+		t.Fatalf("expected callback to continue after panic, got %#v", lines)
+	}
+	if got := transport.stderrBuf.String(); got != "first\nsecond\n" {
+		t.Fatalf("unexpected buffered stderr: %q", got)
+	}
+}
+
+func firstOrEmpty(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
 }
 
 func TestVersionHelpers(t *testing.T) {

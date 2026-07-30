@@ -132,48 +132,11 @@ func GetSessionMessages(sessionID string, directory string, limit int, offset in
 		return []SessionRecord{}, err
 	}
 
-	file, err := os.Open(path)
+	entries, err := readTranscriptEntries(path)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	buf := make([]byte, 0, 1024*1024)
-	scanner.Buffer(buf, 8*1024*1024)
-
-	records := make([]SessionRecord, 0)
-	for scanner.Scan() {
-		var entry map[string]any
-		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
-			continue
-		}
-		typ := stringFromAny(entry["type"])
-		if typ != "user" && typ != "assistant" {
-			continue
-		}
-		records = append(records, SessionRecord{
-			Type:            typ,
-			UUID:            stringFromAny(entry["uuid"]),
-			SessionID:       stringFromAny(entry["sessionId"]),
-			Message:         entry["message"],
-			ParentToolUseID: nil,
-		})
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-
-	if offset > 0 {
-		if offset >= len(records) {
-			return []SessionRecord{}, nil
-		}
-		records = records[offset:]
-	}
-	if limit > 0 && limit < len(records) {
-		records = records[:limit]
-	}
-	return records, nil
+	return conversationRecords(entries, limit, offset), nil
 }
 
 // ListSubagents returns the IDs of subagent transcripts belonging to a session.
@@ -237,7 +200,11 @@ func ListSubagentsFromStore(store SessionStore, sessionID string, directory stri
 	if err != nil {
 		return nil, err
 	}
-	subkeys, err := store.ListSubkeys(SessionListSubkeysKey{ProjectKey: projectKey, SessionID: sessionID})
+	subkeyStore, ok := store.(SessionSubkeyStore)
+	if !ok {
+		return nil, fmt.Errorf("session store does not implement ListSubkeys; listing subagents requires SessionSubkeyStore")
+	}
+	subkeys, err := subkeyStore.ListSubkeys(SessionListSubkeysKey{ProjectKey: projectKey, SessionID: sessionID})
 	if err != nil {
 		return nil, err
 	}
@@ -266,19 +233,22 @@ func GetSubagentMessagesFromStore(store SessionStore, sessionID string, agentID 
 	if err != nil {
 		return nil, err
 	}
-	subkeys, err := store.ListSubkeys(SessionListSubkeysKey{ProjectKey: projectKey, SessionID: sessionID})
-	if err != nil {
-		return nil, err
-	}
-	subpath := ""
-	for _, candidate := range subkeys {
-		if subagentIDFromSubpath(candidate) == agentID {
-			subpath = candidate
-			break
+	subpath := "subagents/agent-" + agentID
+	if subkeyStore, ok := store.(SessionSubkeyStore); ok {
+		subkeys, err := subkeyStore.ListSubkeys(SessionListSubkeysKey{ProjectKey: projectKey, SessionID: sessionID})
+		if err != nil {
+			return nil, err
 		}
-	}
-	if subpath == "" {
-		return []SessionRecord{}, nil
+		subpath = ""
+		for _, candidate := range subkeys {
+			if subagentIDFromSubpath(candidate) == agentID {
+				subpath = candidate
+				break
+			}
+		}
+		if subpath == "" {
+			return []SessionRecord{}, nil
+		}
 	}
 	entries, err := store.Load(SessionKey{ProjectKey: projectKey, SessionID: sessionID, Subpath: subpath})
 	if err != nil {
@@ -291,6 +261,371 @@ func GetSubagentMessagesFromStore(store SessionStore, sessionID string, agentID 
 		}
 	}
 	return subagentRecords(raw, limit, offset), nil
+}
+
+// ListSessionsFromStore lists sessions maintained by a SessionStore.
+func ListSessionsFromStore(store SessionStore, directory string, limit int, offset int) ([]SessionInfo, error) {
+	listStore, ok := store.(SessionListStore)
+	if !ok {
+		return nil, fmt.Errorf("session store does not implement ListSessions; listing sessions requires SessionListStore")
+	}
+	projectKey, err := ProjectKeyForDirectory(directory)
+	if err != nil {
+		return nil, err
+	}
+	list, err := listStore.ListSessions(projectKey)
+	if err != nil {
+		return nil, err
+	}
+	infos := make([]SessionInfo, 0, len(list))
+	for _, item := range list {
+		info, err := GetSessionInfoFromStore(store, item.SessionID, directory)
+		if err != nil || info == nil {
+			continue
+		}
+		info.LastModified = item.MTime
+		infos = append(infos, *info)
+	}
+	slices.SortFunc(infos, func(a, b SessionInfo) int {
+		switch {
+		case a.LastModified > b.LastModified:
+			return -1
+		case a.LastModified < b.LastModified:
+			return 1
+		default:
+			return strings.Compare(a.SessionID, b.SessionID)
+		}
+	})
+	if offset > 0 {
+		if offset >= len(infos) {
+			return []SessionInfo{}, nil
+		}
+		infos = infos[offset:]
+	}
+	if limit > 0 && limit < len(infos) {
+		infos = infos[:limit]
+	}
+	return infos, nil
+}
+
+// GetSessionInfoFromStore returns metadata derived from a stored transcript.
+func GetSessionInfoFromStore(store SessionStore, sessionID string, directory string) (*SessionInfo, error) {
+	if !isUUID(sessionID) {
+		return nil, nil
+	}
+	projectKey, err := ProjectKeyForDirectory(directory)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := store.Load(SessionKey{ProjectKey: projectKey, SessionID: sessionID})
+	if err != nil || len(entries) == 0 {
+		return nil, err
+	}
+	return sessionInfoFromStoreEntries(entries, sessionID, directory), nil
+}
+
+// GetSessionMessagesFromStore returns the visible conversation chain from a stored transcript.
+func GetSessionMessagesFromStore(store SessionStore, sessionID string, directory string, limit int, offset int) ([]SessionRecord, error) {
+	if !isUUID(sessionID) {
+		return []SessionRecord{}, nil
+	}
+	projectKey, err := ProjectKeyForDirectory(directory)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := store.Load(SessionKey{ProjectKey: projectKey, SessionID: sessionID})
+	if err != nil || len(entries) == 0 {
+		return []SessionRecord{}, err
+	}
+	transcript := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		if isTranscriptEntry(entry) {
+			transcript = append(transcript, entry)
+		}
+	}
+	return conversationRecords(transcript, limit, offset), nil
+}
+
+// RenameSessionViaStore appends a custom title entry to a SessionStore.
+func RenameSessionViaStore(store SessionStore, sessionID string, title string, directory string) error {
+	if !isUUID(sessionID) {
+		return fmt.Errorf("invalid session_id: %s", sessionID)
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return fmt.Errorf("title must be non-empty")
+	}
+	return appendStoreSessionEntry(store, sessionID, directory, SessionStoreEntry{
+		"type": "custom-title", "customTitle": title, "sessionId": sessionID, "uuid": newUUID(), "timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+	})
+}
+
+// TagSessionViaStore appends a tag entry to a SessionStore.
+func TagSessionViaStore(store SessionStore, sessionID string, tag string, directory string) error {
+	if !isUUID(sessionID) {
+		return fmt.Errorf("invalid session_id: %s", sessionID)
+	}
+	tag = strings.TrimSpace(sanitizeUnicode(tag))
+	if tag == "" {
+		return fmt.Errorf("tag must be non-empty")
+	}
+	return appendStoreSessionEntry(store, sessionID, directory, SessionStoreEntry{
+		"type": "tag", "tag": tag, "sessionId": sessionID, "uuid": newUUID(), "timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+	})
+}
+
+// ClearSessionTagViaStore clears a session tag in a SessionStore.
+func ClearSessionTagViaStore(store SessionStore, sessionID string, directory string) error {
+	if !isUUID(sessionID) {
+		return fmt.Errorf("invalid session_id: %s", sessionID)
+	}
+	return appendStoreSessionEntry(store, sessionID, directory, SessionStoreEntry{
+		"type": "tag", "tag": "", "sessionId": sessionID, "uuid": newUUID(), "timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+	})
+}
+
+// DeleteSessionViaStore deletes a transcript when the store supports SessionDeleteStore.
+func DeleteSessionViaStore(store SessionStore, sessionID string, directory string) error {
+	if !isUUID(sessionID) {
+		return fmt.Errorf("invalid session_id: %s", sessionID)
+	}
+	deleteStore, ok := store.(SessionDeleteStore)
+	if !ok {
+		return nil
+	}
+	projectKey, err := ProjectKeyForDirectory(directory)
+	if err != nil {
+		return err
+	}
+	return deleteStore.Delete(SessionKey{ProjectKey: projectKey, SessionID: sessionID})
+}
+
+// ForkSessionViaStore forks a stored transcript using the same transform as local sessions.
+func ForkSessionViaStore(store SessionStore, sessionID string, directory string, upToMessageID string, title string) (*ForkResult, error) {
+	if !isUUID(sessionID) {
+		return nil, fmt.Errorf("invalid session_id: %s", sessionID)
+	}
+	if upToMessageID != "" && !isUUID(upToMessageID) {
+		return nil, fmt.Errorf("invalid up_to_message_id: %s", upToMessageID)
+	}
+	projectKey, err := ProjectKeyForDirectory(directory)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := store.Load(SessionKey{ProjectKey: projectKey, SessionID: sessionID})
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("session %s not found", sessionID)
+	}
+	content, err := sessionStoreEntriesJSONL(entries)
+	if err != nil {
+		return nil, err
+	}
+	transcript, replacements := parseForkTranscript(content, sessionID)
+	info := sessionInfoFromStoreEntries(entries, sessionID, directory)
+	derivedTitle := ""
+	if info != nil {
+		derivedTitle = firstNonEmpty(info.CustomTitle, info.Summary)
+	}
+	forkedID, lines, err := buildForkLines(transcript, replacements, sessionID, upToMessageID, title, derivedTitle)
+	if err != nil {
+		return nil, err
+	}
+	forkEntries := make([]SessionStoreEntry, 0, len(lines))
+	for _, line := range lines {
+		var entry SessionStoreEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			return nil, err
+		}
+		forkEntries = append(forkEntries, entry)
+	}
+	if err := store.Append(SessionKey{ProjectKey: projectKey, SessionID: forkedID}, forkEntries); err != nil {
+		return nil, err
+	}
+	return &ForkResult{SessionID: forkedID}, nil
+}
+
+// ImportSessionToStore replays a local session transcript into a SessionStore.
+// Subagent transcripts and their metadata sidecars are included when requested.
+func ImportSessionToStore(store SessionStore, sessionID string, directory string, includeSubagents bool, batchSize int) error {
+	if !isUUID(sessionID) {
+		return fmt.Errorf("invalid session_id: %s", sessionID)
+	}
+	path, err := findSessionFile(sessionID, directory)
+	if err != nil {
+		return err
+	}
+	if path == "" {
+		return fmt.Errorf("session %s not found", sessionID)
+	}
+	if batchSize <= 0 {
+		batchSize = 500
+	}
+	projectKey := filepath.Base(filepath.Dir(path))
+	mainKey := SessionKey{ProjectKey: projectKey, SessionID: sessionID}
+	if err := appendJSONLFileToStore(store, mainKey, path, batchSize); err != nil {
+		return err
+	}
+	if !includeSubagents {
+		return nil
+	}
+
+	sessionDir := strings.TrimSuffix(path, ".jsonl")
+	for _, subagentPath := range collectJSONLFiles(filepath.Join(sessionDir, "subagents")) {
+		rel, err := filepath.Rel(sessionDir, subagentPath)
+		if err != nil {
+			return err
+		}
+		subpath := strings.TrimSuffix(filepath.ToSlash(rel), ".jsonl")
+		key := SessionKey{ProjectKey: projectKey, SessionID: sessionID, Subpath: subpath}
+		if err := appendJSONLFileToStore(store, key, subagentPath, batchSize); err != nil {
+			return err
+		}
+		metaPath := strings.TrimSuffix(subagentPath, ".jsonl") + ".meta.json"
+		meta, err := os.ReadFile(metaPath)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		metadata := SessionStoreEntry{"type": "agent_metadata"}
+		if err := json.Unmarshal(meta, &metadata); err != nil {
+			return fmt.Errorf("parsing subagent metadata %s: %w", metaPath, err)
+		}
+		metadata["type"] = "agent_metadata"
+		if err := store.Append(key, []SessionStoreEntry{metadata}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func appendJSONLFileToStore(store SessionStore, key SessionKey, path string, batchSize int) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 8*1024*1024)
+	batch := make([]SessionStoreEntry, 0, batchSize)
+	batchBytes := 0
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var entry SessionStoreEntry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			return fmt.Errorf("parsing session transcript %s: %w", path, err)
+		}
+		batch = append(batch, entry)
+		batchBytes += len(line)
+		if len(batch) >= batchSize || batchBytes >= 1<<20 {
+			if err := store.Append(key, batch); err != nil {
+				return err
+			}
+			batch = make([]SessionStoreEntry, 0, batchSize)
+			batchBytes = 0
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	if len(batch) > 0 {
+		return store.Append(key, batch)
+	}
+	return nil
+}
+
+func collectJSONLFiles(baseDir string) []string {
+	entries, err := os.ReadDir(baseDir)
+	if err != nil {
+		return nil
+	}
+	files := make([]string, 0)
+	for _, entry := range entries {
+		path := filepath.Join(baseDir, entry.Name())
+		if entry.IsDir() {
+			files = append(files, collectJSONLFiles(path)...)
+		} else if strings.HasSuffix(entry.Name(), ".jsonl") {
+			files = append(files, path)
+		}
+	}
+	return files
+}
+
+func appendStoreSessionEntry(store SessionStore, sessionID string, directory string, entry SessionStoreEntry) error {
+	projectKey, err := ProjectKeyForDirectory(directory)
+	if err != nil {
+		return err
+	}
+	return store.Append(SessionKey{ProjectKey: projectKey, SessionID: sessionID}, []SessionStoreEntry{entry})
+}
+
+func sessionInfoFromStoreEntries(entries []SessionStoreEntry, sessionID string, directory string) *SessionInfo {
+	var customTitle, lastPrompt, summary, gitBranch, cwd, tag, firstPrompt string
+	var createdAt int64
+	var fileSize int64
+	for _, entry := range entries {
+		data, _ := json.Marshal(entry)
+		fileSize += int64(len(data) + 1)
+		if custom := stringFromAny(entry["customTitle"]); custom != "" {
+			customTitle = custom
+		}
+		if title := stringFromAny(entry["aiTitle"]); title != "" && customTitle == "" {
+			customTitle = title
+		}
+		if value := stringFromAny(entry["lastPrompt"]); value != "" {
+			lastPrompt = value
+		}
+		if value := stringFromAny(entry["summary"]); value != "" {
+			summary = value
+		}
+		if value := stringFromAny(entry["gitBranch"]); value != "" {
+			gitBranch = value
+		}
+		if value := stringFromAny(entry["cwd"]); value != "" && cwd == "" {
+			cwd = value
+		}
+		if stringFromAny(entry["type"]) == "tag" {
+			tag = stringFromAny(entry["tag"])
+		}
+		if createdAt == 0 {
+			createdAt = parseCreatedAt(stringFromAny(entry["timestamp"]))
+		}
+		if firstPrompt == "" && stringFromAny(entry["type"]) == "user" {
+			message := mapFromAny(entry["message"])
+			prompt := strings.TrimSpace(extractMessageText(message["content"]))
+			if prompt != "" && !skipFirstPromptPattern.MatchString(prompt) {
+				firstPrompt = prompt
+			}
+		}
+	}
+	resolvedSummary := firstNonEmpty(customTitle, lastPrompt, summary, firstPrompt)
+	if resolvedSummary == "" {
+		return nil
+	}
+	if cwd == "" {
+		cwd = directory
+	}
+	return &SessionInfo{SessionID: sessionID, Summary: resolvedSummary, FileSize: fileSize, CustomTitle: customTitle, FirstPrompt: firstPrompt, GitBranch: gitBranch, CWD: cwd, Tag: tag, CreatedAt: createdAt}
+}
+
+func sessionStoreEntriesJSONL(entries []SessionStoreEntry) ([]byte, error) {
+	var content bytes.Buffer
+	for _, entry := range entries {
+		line, err := json.Marshal(entry)
+		if err != nil {
+			return nil, err
+		}
+		content.Write(line)
+		content.WriteByte('\n')
+	}
+	return content.Bytes(), nil
 }
 
 type subagentFile struct {
@@ -347,11 +682,129 @@ func readTranscriptEntries(path string) ([]map[string]any, error) {
 	entries := make([]map[string]any, 0)
 	for scanner.Scan() {
 		var entry map[string]any
-		if json.Unmarshal(scanner.Bytes(), &entry) == nil {
+		if json.Unmarshal(scanner.Bytes(), &entry) == nil && isTranscriptEntry(entry) {
 			entries = append(entries, entry)
 		}
 	}
 	return entries, scanner.Err()
+}
+
+func isTranscriptEntry(entry map[string]any) bool {
+	if stringFromAny(entry["uuid"]) == "" {
+		return false
+	}
+	switch stringFromAny(entry["type"]) {
+	case "user", "assistant", "progress", "system", "attachment":
+		return true
+	default:
+		return false
+	}
+}
+
+func conversationRecords(entries []map[string]any, limit int, offset int) []SessionRecord {
+	chain := buildConversationChain(entries)
+	records := make([]SessionRecord, 0, len(chain))
+	for _, entry := range chain {
+		if !isVisibleConversationEntry(entry) {
+			continue
+		}
+		records = append(records, sessionRecordFromEntry(entry))
+	}
+	return paginateSessionRecords(records, limit, offset)
+}
+
+func buildConversationChain(entries []map[string]any) []map[string]any {
+	byUUID := make(map[string]map[string]any, len(entries))
+	index := make(map[string]int, len(entries))
+	parents := make(map[string]struct{}, len(entries))
+	for i, entry := range entries {
+		uuid := stringFromAny(entry["uuid"])
+		byUUID[uuid] = entry
+		index[uuid] = i
+		if parent := stringFromAny(entry["parentUuid"]); parent != "" {
+			parents[parent] = struct{}{}
+		}
+	}
+
+	var leaf map[string]any
+	var fallbackLeaf map[string]any
+	leafIndex := -1
+	fallbackIndex := -1
+	for _, terminal := range entries {
+		if _, hasChild := parents[stringFromAny(terminal["uuid"])]; hasChild {
+			continue
+		}
+		candidate := terminal
+		seen := map[string]struct{}{}
+		for candidate != nil {
+			uuid := stringFromAny(candidate["uuid"])
+			if _, duplicate := seen[uuid]; duplicate {
+				break
+			}
+			seen[uuid] = struct{}{}
+			typ := stringFromAny(candidate["type"])
+			if typ == "user" || typ == "assistant" {
+				candidateIndex := index[uuid]
+				if candidateIndex > fallbackIndex {
+					fallbackLeaf = candidate
+					fallbackIndex = candidateIndex
+				}
+				if !boolFromAny(candidate["isSidechain"]) && stringFromAny(candidate["teamName"]) == "" && !boolFromAny(candidate["isMeta"]) && candidateIndex > leafIndex {
+					leaf = candidate
+					leafIndex = candidateIndex
+				}
+				break
+			}
+			candidate = byUUID[stringFromAny(candidate["parentUuid"])]
+		}
+	}
+	if leaf == nil {
+		leaf = fallbackLeaf
+	}
+	if leaf == nil {
+		return []map[string]any{}
+	}
+
+	chain := make([]map[string]any, 0)
+	seen := map[string]struct{}{}
+	for current := leaf; current != nil; current = byUUID[stringFromAny(current["parentUuid"])] {
+		uuid := stringFromAny(current["uuid"])
+		if _, duplicate := seen[uuid]; duplicate {
+			break
+		}
+		seen[uuid] = struct{}{}
+		chain = append(chain, current)
+	}
+	slices.Reverse(chain)
+	return chain
+}
+
+func isVisibleConversationEntry(entry map[string]any) bool {
+	typ := stringFromAny(entry["type"])
+	return (typ == "user" || typ == "assistant") && !boolFromAny(entry["isMeta"]) && !boolFromAny(entry["isSidechain"]) && stringFromAny(entry["teamName"]) == ""
+}
+
+func sessionRecordFromEntry(entry map[string]any) SessionRecord {
+	return SessionRecord{
+		Type:            stringFromAny(entry["type"]),
+		UUID:            stringFromAny(entry["uuid"]),
+		SessionID:       stringFromAny(entry["sessionId"]),
+		Message:         entry["message"],
+		ParentToolUseID: nil,
+	}
+}
+
+func paginateSessionRecords(records []SessionRecord, limit int, offset int) []SessionRecord {
+	if offset > 0 {
+		if offset >= len(records) {
+			return []SessionRecord{}
+		}
+		records = records[offset:]
+	}
+	if limit > 0 && limit < len(records) {
+		records = records[:limit]
+	}
+	return records
 }
 
 func subagentRecords(entries []map[string]any, limit int, offset int) []SessionRecord {
