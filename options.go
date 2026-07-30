@@ -11,6 +11,20 @@ const (
 	PermissionModeAuto              PermissionMode = "auto"
 )
 
+type SdkBeta string
+
+const (
+	SdkBetaContext1M20250807 SdkBeta = "context-1m-2025-08-07"
+)
+
+type SettingSource string
+
+const (
+	SettingSourceUser    SettingSource = "user"
+	SettingSourceProject SettingSource = "project"
+	SettingSourceLocal   SettingSource = "local"
+)
+
 type EffortLevel string
 
 const (
@@ -86,6 +100,23 @@ type PermissionRuleValue struct {
 	RuleContent string `json:"ruleContent,omitempty"`
 }
 
+type PermissionBehavior string
+
+const (
+	PermissionBehaviorAllow PermissionBehavior = "allow"
+	PermissionBehaviorDeny  PermissionBehavior = "deny"
+	PermissionBehaviorAsk   PermissionBehavior = "ask"
+)
+
+type PermissionUpdateDestination string
+
+const (
+	PermissionUpdateDestinationUserSettings    PermissionUpdateDestination = "userSettings"
+	PermissionUpdateDestinationProjectSettings PermissionUpdateDestination = "projectSettings"
+	PermissionUpdateDestinationLocalSettings   PermissionUpdateDestination = "localSettings"
+	PermissionUpdateDestinationSession         PermissionUpdateDestination = "session"
+)
+
 type PermissionUpdate struct {
 	Type        string                `json:"type"`
 	Rules       []PermissionRuleValue `json:"rules,omitempty"`
@@ -121,6 +152,21 @@ type CanUseToolFunc func(req ToolPermissionRequest) (PermissionDecision, error)
 type HookContext struct {
 	Signal any
 }
+
+type HookEvent string
+
+const (
+	HookEventPreToolUse         HookEvent = "PreToolUse"
+	HookEventPostToolUse        HookEvent = "PostToolUse"
+	HookEventPostToolUseFailure HookEvent = "PostToolUseFailure"
+	HookEventUserPromptSubmit   HookEvent = "UserPromptSubmit"
+	HookEventStop               HookEvent = "Stop"
+	HookEventSubagentStop       HookEvent = "SubagentStop"
+	HookEventPreCompact         HookEvent = "PreCompact"
+	HookEventNotification       HookEvent = "Notification"
+	HookEventSubagentStart      HookEvent = "SubagentStart"
+	HookEventPermissionRequest  HookEvent = "PermissionRequest"
+)
 
 type HookOutput map[string]any
 
@@ -211,6 +257,78 @@ type MCPHTTPServerConfig struct {
 
 func (MCPHTTPServerConfig) mcpServerConfigMarker() {}
 
+type MCPSSEServerConfig struct {
+	Type    string            `json:"type"`
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers,omitempty"`
+}
+
+func (MCPSSEServerConfig) mcpServerConfigMarker() {}
+
+type MCPServerConnectionStatus string
+
+const (
+	MCPServerStatusConnected MCPServerConnectionStatus = "connected"
+	MCPServerStatusFailed    MCPServerConnectionStatus = "failed"
+	MCPServerStatusNeedsAuth MCPServerConnectionStatus = "needs-auth"
+	MCPServerStatusPending   MCPServerConnectionStatus = "pending"
+	MCPServerStatusDisabled  MCPServerConnectionStatus = "disabled"
+)
+
+type MCPServerInfo struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+type MCPToolInfo struct {
+	Name        string              `json:"name"`
+	Description string              `json:"description,omitempty"`
+	Annotations *MCPToolAnnotations `json:"annotations,omitempty"`
+}
+
+type MCPServerStatus struct {
+	Name       string                    `json:"name"`
+	Status     MCPServerConnectionStatus `json:"status"`
+	ServerInfo *MCPServerInfo            `json:"serverInfo,omitempty"`
+	Error      string                    `json:"error,omitempty"`
+	Config     map[string]any            `json:"config,omitempty"`
+	Scope      string                    `json:"scope,omitempty"`
+	Tools      []MCPToolInfo             `json:"tools,omitempty"`
+}
+
+type MCPStatusResponse struct {
+	MCPServers []MCPServerStatus `json:"mcpServers"`
+}
+
+type ContextUsageCategory struct {
+	Name       string `json:"name"`
+	Tokens     int    `json:"tokens"`
+	Color      string `json:"color"`
+	IsDeferred bool   `json:"isDeferred,omitempty"`
+}
+
+type ContextUsageResponse struct {
+	Categories           []ContextUsageCategory `json:"categories"`
+	TotalTokens          int                    `json:"totalTokens"`
+	MaxTokens            int                    `json:"maxTokens"`
+	RawMaxTokens         int                    `json:"rawMaxTokens"`
+	Percentage           float64                `json:"percentage"`
+	Model                string                 `json:"model"`
+	IsAutoCompactEnabled bool                   `json:"isAutoCompactEnabled"`
+	MemoryFiles          []map[string]any       `json:"memoryFiles"`
+	MCPTools             []map[string]any       `json:"mcpTools"`
+	Agents               []map[string]any       `json:"agents"`
+	GridRows             [][]map[string]any     `json:"gridRows"`
+	AutoCompactThreshold int                    `json:"autoCompactThreshold,omitempty"`
+	DeferredBuiltinTools []map[string]any       `json:"deferredBuiltinTools,omitempty"`
+	SystemTools          []map[string]any       `json:"systemTools,omitempty"`
+	SystemPromptSections []map[string]any       `json:"systemPromptSections,omitempty"`
+	SlashCommands        map[string]any         `json:"slashCommands,omitempty"`
+	SkillsUsage          map[string]any         `json:"skills,omitempty"`
+	MessageBreakdown     map[string]any         `json:"messageBreakdown,omitempty"`
+	APIUsage             map[string]any         `json:"apiUsage,omitempty"`
+}
+
 const PluginTypeLocal = "local"
 
 type SDKPluginConfig struct {
@@ -218,9 +336,18 @@ type SDKPluginConfig struct {
 	Path string
 }
 
+type ExtraArgValue struct {
+	Value  string
+	IsFlag bool
+}
+
 type Options struct {
 	CLIPath                 string
 	SkipCLIVersionCheck     bool
+	AllowCLIDownload        bool
+	CLIVersion              string
+	CLICacheDir             string
+	CLIDownloadURL          string
 	CWD                     string
 	Env                     map[string]string
 	User                    string
@@ -252,11 +379,9 @@ type Options struct {
 	StrictMCPConfig         bool
 	ForkSession             bool
 	SettingSources          []string
-	Skills                  []string
-	EnableAllSkills         bool
+	Skills                  any
 	Plugins                 []SDKPluginConfig
-	ExtraArgs               map[string]string
-	ExtraFlags              []string
+	ExtraArgs               map[string]ExtraArgValue
 	Thinking                *ThinkingConfig
 	MaxThinkingTokens       int
 	Effort                  EffortLevel

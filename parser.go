@@ -11,9 +11,14 @@ func ParseMessage(data map[string]any) (Message, error) {
 	if msgType == "system" {
 		subtype, _ := data["subtype"].(string)
 		if subtype == "hook_started" || subtype == "hook_response" {
+			hookEventName := stringFromAny(firstNonNil(
+				data["hook_event"],
+				data["hook_name"],
+				data["hook_event_name"],
+			))
 			return &HookEventMessage{
 				SystemMessage: SystemMessage{Subtype: subtype, Data: data},
-				HookEventName: stringFromAny(data["hook_event"]),
+				HookEventName: hookEventName,
 				SessionID:     stringFromAny(data["session_id"]),
 				UUID:          stringFromAny(data["uuid"]),
 			}, nil
@@ -48,11 +53,75 @@ func ParseMessage(data map[string]any) (Message, error) {
 			UUID:            stringFromAny(data["uuid"]),
 		}, nil
 	case "system":
-		return &SystemMessage{
-			Subtype: stringFromAny(data["subtype"]),
-			Data:    data,
-		}, nil
+		subtype := stringFromAny(data["subtype"])
+		switch subtype {
+		case "task_started":
+			return &TaskStartedMessage{
+				SystemMessage: SystemMessage{Subtype: subtype, Data: data},
+				TaskID:        stringFromAny(data["task_id"]),
+				Description:   stringFromAny(data["description"]),
+				UUID:          stringFromAny(data["uuid"]),
+				SessionID:     stringFromAny(data["session_id"]),
+				ToolUseID:     stringFromAny(data["tool_use_id"]),
+				TaskType:      stringFromAny(data["task_type"]),
+			}, nil
+		case "task_progress":
+			return &TaskProgressMessage{
+				SystemMessage: SystemMessage{Subtype: subtype, Data: data},
+				TaskID:        stringFromAny(data["task_id"]),
+				Description:   stringFromAny(data["description"]),
+				Usage:         mapFromAny(data["usage"]),
+				UUID:          stringFromAny(data["uuid"]),
+				SessionID:     stringFromAny(data["session_id"]),
+				ToolUseID:     stringFromAny(data["tool_use_id"]),
+				LastToolName:  stringFromAny(data["last_tool_name"]),
+			}, nil
+		case "task_notification":
+			return &TaskNotificationMessage{
+				SystemMessage: SystemMessage{Subtype: subtype, Data: data},
+				TaskID:        stringFromAny(data["task_id"]),
+				Status:        stringFromAny(data["status"]),
+				OutputFile:    stringFromAny(data["output_file"]),
+				Summary:       stringFromAny(data["summary"]),
+				UUID:          stringFromAny(data["uuid"]),
+				SessionID:     stringFromAny(data["session_id"]),
+				ToolUseID:     stringFromAny(data["tool_use_id"]),
+				Usage:         mapFromAny(data["usage"]),
+			}, nil
+		case "task_updated":
+			patch := mapFromAny(data["patch"])
+			if patch == nil {
+				patch = map[string]any{}
+			}
+			return &TaskUpdatedMessage{
+				SystemMessage: SystemMessage{Subtype: subtype, Data: data},
+				TaskID:        stringFromAny(data["task_id"]),
+				Patch:         patch,
+				Status:        TaskUpdatedStatus(stringFromAny(patch["status"])),
+				SessionID:     stringFromAny(data["session_id"]),
+				UUID:          stringFromAny(data["uuid"]),
+			}, nil
+		case "mirror_error":
+			return &MirrorErrorMessage{
+				SystemMessage: SystemMessage{Subtype: subtype, Data: data},
+				Key:           data["key"],
+				Error:         stringFromAny(data["error"]),
+			}, nil
+		default:
+			return &SystemMessage{
+				Subtype: subtype,
+				Data:    data,
+			}, nil
+		}
 	case "result":
+		var deferred *DeferredToolUse
+		if rawDeferred := mapFromAny(data["deferred_tool_use"]); rawDeferred != nil {
+			deferred = &DeferredToolUse{
+				ID:    stringFromAny(rawDeferred["id"]),
+				Name:  stringFromAny(rawDeferred["name"]),
+				Input: mapFromAny(rawDeferred["input"]),
+			}
+		}
 		return &ResultMessage{
 			Subtype:           stringFromAny(data["subtype"]),
 			DurationMS:        intFromAny(data["duration_ms"]),
@@ -65,30 +134,38 @@ func ParseMessage(data map[string]any) (Message, error) {
 			Usage:             mapFromAny(data["usage"]),
 			Result:            stringFromAny(data["result"]),
 			StructuredOutput:  data["structured_output"],
-			ModelUsage:        mapFromAny(data["model_usage"]),
+			ModelUsage:        mapFromAny(firstNonNil(data["modelUsage"], data["model_usage"])),
 			PermissionDenials: sliceFromAny(data["permission_denials"]),
-			DeferredToolUse:   data["deferred_tool_use"],
+			DeferredToolUse:   deferred,
 			Errors:            stringSliceFromAny(data["errors"]),
 			APIErrorStatus:    intFromAny(data["api_error_status"]),
 			UUID:              stringFromAny(data["uuid"]),
 		}, nil
 	case "stream_event":
 		return &StreamEvent{
-			Subtype:   stringFromAny(data["subtype"]),
-			Delta:     stringFromAny(data["delta"]),
-			SessionID: stringFromAny(data["session_id"]),
-			UUID:      stringFromAny(data["uuid"]),
-			Raw:       data,
+			UUID:            stringFromAny(data["uuid"]),
+			SessionID:       stringFromAny(data["session_id"]),
+			Event:           mapFromAny(data["event"]),
+			ParentToolUseID: stringFromAny(data["parent_tool_use_id"]),
 		}, nil
-	case "rate_limit":
+	case "rate_limit_event":
+		rawInfo := mapFromAny(data["rate_limit_info"])
 		return &RateLimitEvent{
-			Subtype:       stringFromAny(data["subtype"]),
-			RateLimitInfo: mapFromAny(data["rate_limit_info"]),
-			UUID:          stringFromAny(data["uuid"]),
-			SessionID:     stringFromAny(data["session_id"]),
+			RateLimitInfo: RateLimitInfo{
+				Status:                stringFromAny(rawInfo["status"]),
+				ResetsAt:              intFromAny(rawInfo["resetsAt"]),
+				RateLimitType:         stringFromAny(rawInfo["rateLimitType"]),
+				Utilization:           floatFromAny(rawInfo["utilization"]),
+				OverageStatus:         stringFromAny(rawInfo["overageStatus"]),
+				OverageResetsAt:       intFromAny(rawInfo["overageResetsAt"]),
+				OverageDisabledReason: stringFromAny(rawInfo["overageDisabledReason"]),
+				Raw:                   rawInfo,
+			},
+			UUID:      stringFromAny(data["uuid"]),
+			SessionID: stringFromAny(data["session_id"]),
 		}, nil
 	default:
-		return &UnknownMessage{Type: msgType, Raw: data}, nil
+		return nil, nil
 	}
 }
 
@@ -189,4 +266,13 @@ func floatFromAny(v any) float64 {
 	default:
 		return 0
 	}
+}
+
+func firstNonNil(values ...any) any {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
 }

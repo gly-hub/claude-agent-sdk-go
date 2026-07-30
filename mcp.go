@@ -350,6 +350,16 @@ func marshalMCPServerConfig(config MCPServerConfig) (map[string]any, error) {
 			return nil, err
 		}
 		return out, nil
+	case MCPSSEServerConfig:
+		raw, err := json.Marshal(cfg)
+		if err != nil {
+			return nil, err
+		}
+		var out map[string]any
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return nil, err
+		}
+		return out, nil
 	default:
 		return nil, fmt.Errorf("unsupported MCP server config type %T", config)
 	}

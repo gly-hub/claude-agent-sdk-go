@@ -75,3 +75,19 @@ func TestClientHandleMCPMessage(t *testing.T) {
 		t.Fatalf("unexpected MCP response: %#v", resp)
 	}
 }
+
+func TestMarshalMCPSSEServerConfig(t *testing.T) {
+	got, err := marshalMCPServerConfig(MCPSSEServerConfig{
+		Type: "sse",
+		URL:  "https://example.com/sse",
+		Headers: map[string]string{
+			"Authorization": "Bearer token",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshalMCPServerConfig() error = %v", err)
+	}
+	if got["type"] != "sse" || got["url"] != "https://example.com/sse" {
+		t.Fatalf("unexpected SSE config: %#v", got)
+	}
+}

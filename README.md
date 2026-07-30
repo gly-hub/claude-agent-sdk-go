@@ -1,48 +1,52 @@
 # Claude Agent SDK for Go
 
-一个面向 Go 的 Claude Agent SDK 封装，参考了 Python 版本的核心能力，并按 Go 的使用习惯做了接口收敛。
+一个面向 Go 的 Claude Agent SDK，目标是尽量与 Python 版行为保持一致，同时保留 Go 常见的显式 API 风格。
 
-## 当前状态
+## 已实现能力
 
-这是一个已经可以开发和集成的首版 SDK，重点完成了核心会话、hooks、session 管理、session store 和进程内 MCP server。
+- `Query` 单次请求
+- `Client` 多轮交互式会话
+- `stream-json` 子进程传输
+- 控制协议：`initialize`、`interrupt`、`set_permission_mode`、`set_model`
+- hooks / `CanUseTool`
+- resume / continue / session store / session mirror
+- SDK 内置 MCP server，支持 `tools/list` / `tools/call`
+- plugins：当前支持 local plugin
+- skills、thinking、effort、sandbox、output format 等 Python 对齐选项
 
-如果你准备把它正式发布，建议优先确认两件事：
+## 示例
 
-- 把 [go.mod](/Users/mac/my-project/claude-agent-sdk-go/go.mod) 里的模块名改成真实仓库地址
-- 按你的发布策略补 `LICENSE`、tag 和 CI
-
-当前版本优先覆盖这些能力：
-
-- 通过 Claude Code CLI 启动会话
-- `Query` 一次性请求
-- `Client` 交互式多轮会话
-- `stream-json` 消息流解析
-- 常用 CLI 选项映射
-- 基础控制协议：`initialize`、`interrupt`、`set_permission_mode`、`set_model`
-- 工具权限回调 `CanUseTool`
-- hooks 回调分发与 `hook_callback` 控制协议
-- 常用运行期控制：`rewind_files`、MCP 重连/开关、`stop_task`
-- 本地 session 管理：列出、读取、重命名、打 tag、删除、fork
-- 进程内 SDK MCP server：支持 `tools/list` / `tools/call`
-- local plugins：通过 `--plugin-dir` 加载插件目录
-
-## 目录
-
-- [examples/quickstart/main.go](/Users/mac/my-project/claude-agent-sdk-go/examples/quickstart/main.go): 最小查询示例
-- [examples/hooks/main.go](/Users/mac/my-project/claude-agent-sdk-go/examples/hooks/main.go): hooks 与工具拦截
-- [examples/mcp_server/main.go](/Users/mac/my-project/claude-agent-sdk-go/examples/mcp_server/main.go): 进程内 MCP 工具示例
-- [examples/chat/main.go](/Users/mac/my-project/claude-agent-sdk-go/examples/chat/main.go): 多轮交互式聊天示例
-- [examples/gin_sse_sqlite_chat](/Users/mac/my-project/claude-agent-sdk-go/examples/gin_sse_sqlite_chat): `gin + SSE + SQLite + static 前端` 的完整多会话 Web 示例
+- [examples/quickstart/main.go](/Users/mac/my-project/claude-agent-sdk-go/examples/quickstart/main.go)：最小查询示例
+- [examples/chat/main.go](/Users/mac/my-project/claude-agent-sdk-go/examples/chat/main.go)：参考 `chat.py` 的多轮聊天示例
+- [examples/hooks/main.go](/Users/mac/my-project/claude-agent-sdk-go/examples/hooks/main.go)：hooks 与工具拦截
+- [examples/mcp_server/main.go](/Users/mac/my-project/claude-agent-sdk-go/examples/mcp_server/main.go)：进程内 MCP 工具示例
+- [examples/otel/main.go](/Users/mac/my-project/claude-agent-sdk-go/examples/otel/main.go)：OTEL trace context 与本地 stdout tracing 示例
 
 ## 安装
-
-因为这个仓库现在还没有绑定最终远程地址，`go.mod` 先用了占位模块名：
 
 ```go
 module github.com/gly-hub/claude-agent-sdk-go
 ```
 
-准备发布时，建议改成你自己的真实模块路径。
+## Claude CLI
+
+SDK 默认按下面顺序查找 Claude Code CLI：
+
+1. `Options.CLIPath`
+2. 当前可执行文件旁边的 `_bundled/claude`
+3. `PATH` 里的 `claude`
+4. 常见安装路径，例如 `~/.local/bin/claude`、`~/.claude/local/claude`
+
+如果不希望主机预装 Claude Code，也不想把 CLI 打进 Go 包，可以显式开启按需下载：
+
+```go
+client := claudeagentsdk.NewClient(claudeagentsdk.Options{
+	AllowCLIDownload: true,
+	CLIVersion:       "2.1.179", // 可选；为空时下载 latest
+})
+```
+
+开启后，只有在本机找不到 Claude CLI 时才会从 `https://claude.ai/install.sh` 下载安装脚本，并把 CLI 缓存在用户 cache 目录。可用 `CLICacheDir` 指定缓存目录，或用 `CLIDownloadURL` 指向内部镜像。
 
 ## 快速开始
 
@@ -52,7 +56,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 
 	claudeagentsdk "github.com/gly-hub/claude-agent-sdk-go"
@@ -70,18 +73,9 @@ func main() {
 	}
 	defer stream.Close()
 
-	for {
-		msg, err := stream.Next(ctx)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		switch m := msg.(type) {
-		case *claudeagentsdk.AssistantMessage:
-			for _, block := range m.Content {
+	for msg := range stream.ReceiveResponseStream(ctx) {
+		if assistant, ok := msg.(*claudeagentsdk.AssistantMessage); ok {
+			for _, block := range assistant.Content {
 				if text, ok := block.(claudeagentsdk.TextBlock); ok {
 					fmt.Println(text.Text)
 				}
@@ -91,46 +85,9 @@ func main() {
 }
 ```
 
-## Plugins
-
-Go 版的 `Plugins` 对齐 Python SDK 0.2.85 的 `plugins` 配置。目前只支持 local plugin，会为每个配置生成一组 `--plugin-dir <path>` 参数。
-
-```go
-client := claudeagentsdk.NewClient(claudeagentsdk.Options{
-	Plugins: []claudeagentsdk.SDKPluginConfig{
-		{
-			Type: claudeagentsdk.PluginTypeLocal,
-			Path: "/absolute/path/to/plugin",
-		},
-	},
-})
-```
-
-## 高级选项
-
-这些选项对齐 Python SDK 0.2.85 的 `ClaudeAgentOptions`，会映射到 Claude Code CLI 参数或环境变量。
-
-```go
-client := claudeagentsdk.NewClient(claudeagentsdk.Options{
-	Sandbox: claudeagentsdk.SandboxSettings{
-		"enabled": true,
-	},
-	OutputFormat: &claudeagentsdk.OutputFormat{
-		Type: "json_schema",
-		Schema: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"title": map[string]any{"type": "string"},
-			},
-		},
-	},
-	TaskBudget:              &claudeagentsdk.TaskBudget{Total: 20_000},
-	EnableFileCheckpointing: true,
-	MaxBufferSize:           2 << 20,
-})
-```
-
 ## 交互式 Client
+
+`ReceiveResponseStream()` 更接近 Python 的 `async for msg in client.receive_response()`。
 
 ```go
 client := claudeagentsdk.NewClient(claudeagentsdk.Options{
@@ -146,12 +103,98 @@ if err := client.SendUser(ctx, "Review this idea and ask one follow-up question.
 	log.Fatal(err)
 }
 
-messages, err := client.ReceiveResponse(ctx)
-if err != nil {
-	log.Fatal(err)
+for msg := range client.ReceiveResponseStream(ctx) {
+	_ = msg
 }
-_ = messages
 ```
+
+如果你需要一次性收集，也可以继续使用：
+
+```go
+messages, err := client.ReceiveResponse(ctx)
+```
+
+连接完成后可从初始化结果里拿到服务端信息：
+
+```go
+info := client.GetServerInfo()
+sessionID, _ := info["session_id"].(string)
+```
+
+## Python 对齐选项
+
+### `Skills`
+
+`Skills` 对齐 Python：
+
+- `nil`：不做 SDK 级自动配置
+- `"all"`：允许 `Skill` 并默认补 `setting_sources=["user","project"]`
+- `[]string{"pdf", "docx"}`：允许指定 skill，并在 initialize 里下发 skill 过滤
+- `[]string{}`：显式发送空 skill 列表，抑制 skill listing
+
+```go
+client := claudeagentsdk.NewClient(claudeagentsdk.Options{
+	Skills: "all",
+})
+```
+
+### `Plugins`
+
+当前与 Python 一样，SDK 仅支持 local plugin，并映射到 `--plugin-dir`：
+
+```go
+client := claudeagentsdk.NewClient(claudeagentsdk.Options{
+	Plugins: []claudeagentsdk.SDKPluginConfig{
+		{
+			Type: claudeagentsdk.PluginTypeLocal,
+			Path: "/absolute/path/to/plugin-or-.claude",
+		},
+	},
+})
+```
+
+### `ExtraArgs`
+
+Go 版使用显式结构区分“带值参数”和“布尔 flag”：
+
+```go
+client := claudeagentsdk.NewClient(claudeagentsdk.Options{
+	ExtraArgs: map[string]claudeagentsdk.ExtraArgValue{
+		"agent":                  {Value: "reviewer"},
+		"disable-slash-commands": {IsFlag: true},
+	},
+})
+```
+
+### 其他常用选项
+
+```go
+client := claudeagentsdk.NewClient(claudeagentsdk.Options{
+	User: "alice",
+	Sandbox: claudeagentsdk.SandboxSettings{
+		"enabled": true,
+	},
+	OutputFormat: &claudeagentsdk.OutputFormat{
+		Type: "json_schema",
+		Schema: map[string]any{
+			"type": "object",
+		},
+	},
+	TaskBudget:              &claudeagentsdk.TaskBudget{Total: 20_000},
+	EnableFileCheckpointing: true,
+	IncludePartialMessages:  true,
+	IncludeHookEvents:       true,
+	MaxBufferSize:           2 << 20,
+})
+```
+
+说明：
+
+- `User` 在 Darwin / Linux 下会尝试以对应系统用户启动 CLI 子进程
+- `IncludePartialMessages=true` 时，会像 Python 一样注入 `CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=1`
+- `Connect(ctx)` / `Query(ctx, ...)` 会从传入的 `context.Context` 里尽力注入 OTEL trace context 到 CLI 环境变量
+- `CLAUDE_CODE_ENTRYPOINT` 默认是 `sdk-go`，但仍可被 `Options.Env` 覆盖
+- `CLAUDE_AGENT_SDK_VERSION` 始终由 SDK 注入
 
 ## Hooks
 
@@ -164,18 +207,13 @@ options := claudeagentsdk.Options{
 				Matcher: "Bash",
 				Hooks: []claudeagentsdk.HookCallback{
 					func(input map[string]any, toolUseID string, ctx claudeagentsdk.HookContext) (claudeagentsdk.HookOutput, error) {
-						toolInput, _ := input["tool_input"].(map[string]any)
-						command, _ := toolInput["command"].(string)
-						if strings.Contains(command, "foo.sh") {
-							return claudeagentsdk.HookOutput{
-								"hookSpecificOutput": map[string]any{
-									"hookEventName": "PreToolUse",
-									"permissionDecision": "deny",
-									"permissionDecisionReason": "blocked by policy",
-								},
-							}, nil
-						}
-						return claudeagentsdk.HookOutput{}, nil
+						return claudeagentsdk.HookOutput{
+							"hookSpecificOutput": map[string]any{
+								"hookEventName":            "PreToolUse",
+								"permissionDecision":       "deny",
+								"permissionDecisionReason": "blocked by policy",
+							},
+						}, nil
 					},
 				},
 			},
@@ -184,29 +222,100 @@ options := claudeagentsdk.Options{
 }
 ```
 
-## Session 管理
+## OTEL Trace Context
+
+如果你的应用已经在用 OpenTelemetry，可以直接把带 span 的 `ctx` 传给 `Connect(ctx)` 或 `Query(ctx, ...)`。SDK 会自动把当前 trace context 注入到 Claude CLI 子进程里。
 
 ```go
-sessions, err := claudeagentsdk.ListSessions("/path/to/project")
-if err != nil {
-	log.Fatal(err)
-}
+package main
 
-messages, err := claudeagentsdk.GetSessionMessages(
-	"550e8400-e29b-41d4-a716-446655440000",
-	"/path/to/project",
-	0,
-	0,
+import (
+	"context"
+	"log"
+
+	claudeagentsdk "github.com/gly-hub/claude-agent-sdk-go"
+	"go.opentelemetry.io/otel"
 )
-if err != nil {
-	log.Fatal(err)
-}
 
-_ = claudeagentsdk.RenameSession("550e8400-e29b-41d4-a716-446655440000", "My Session", "/path/to/project")
-_ = claudeagentsdk.TagSession("550e8400-e29b-41d4-a716-446655440000", "experiment", "/path/to/project")
-fork, _ := claudeagentsdk.ForkSession("550e8400-e29b-41d4-a716-446655440000", "/path/to/project", "", "")
-_ = fork
+func main() {
+	ctx := context.Background()
+	tracer := otel.Tracer("my-app/claude")
+
+	ctx, span := tracer.Start(ctx, "ask-claude")
+	defer span.End()
+
+	stream, err := claudeagentsdk.Query(ctx, "Summarize this repository in 3 bullets.", &claudeagentsdk.Options{
+		SystemPrompt: "You are a concise assistant.",
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer stream.Close()
+
+	for range stream.ReceiveResponseStream(ctx) {
+	}
+}
 ```
+
+效果是：
+
+- 你的应用 span 和 Claude CLI 产生的 spans 会落到同一条 trace 里
+- 如果环境里本来有旧的 `TRACEPARENT` / `TRACESTATE`，SDK 会在有活跃 span 时刷新为当前上下文
+- 如果你显式在 `Options.Env` 里传了 `TRACEPARENT` 或 `TRACESTATE`，仍然以你的配置为准
+
+如果你只是想在本地快速验证，可以用一个 stdout exporter 先把 trace 打到控制台：
+
+```go
+package main
+
+import (
+	"context"
+	"log"
+
+	claudeagentsdk "github.com/gly-hub/claude-agent-sdk-go"
+	"go.opentelemetry.io/otel"
+	stdouttrace "go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+)
+
+func main() {
+	exporter, err := stdouttrace.New(stdouttrace.WithPrettyPrint())
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceName("claude-agent-sdk-go-example"),
+		)),
+	)
+	defer func() {
+		_ = tp.Shutdown(context.Background())
+	}()
+
+	otel.SetTracerProvider(tp)
+
+	ctx := context.Background()
+	tracer := otel.Tracer("example/claude")
+	ctx, span := tracer.Start(ctx, "interactive-query")
+	defer span.End()
+
+	stream, err := claudeagentsdk.Query(ctx, "Say hello in one sentence.", &claudeagentsdk.Options{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer stream.Close()
+
+	for range stream.ReceiveResponseStream(ctx) {
+	}
+}
+```
+
+跑完后你能先在本地看到应用侧 span 输出；如果 Claude CLI 也接入了同一套 tracing 后端，它产生的 spans 会挂在同一条 trace 下。
 
 ## SDK MCP Server
 
@@ -221,7 +330,7 @@ calculator := claudeagentsdk.CreateSDKMCPServer("calculator", "1.0.0", []claudea
 			b, _ := args["b"].(float64)
 			return claudeagentsdk.MCPToolResult{
 				Content: []claudeagentsdk.MCPToolContent{
-					{Type: "text", Text: fmt.Sprintf("%v", a+b)},
+					{Type: "text", Text: fmt.Sprintf("%v + %v = %v", a, b, a+b)},
 				},
 			}, nil
 		},
@@ -232,15 +341,13 @@ client := claudeagentsdk.NewClient(claudeagentsdk.Options{
 	MCPServers: map[string]claudeagentsdk.MCPServerConfig{
 		"calc": calculator,
 	},
-	Tools:        []string{},
-	AllowedTools: []string{"mcp__calc__add"},
+	Tools:           []string{},
+	AllowedTools:    []string{"mcp__calc__add"},
 	StrictMCPConfig: true,
 })
 ```
 
-## 设计说明
+## 当前仍与 Python 不同的地方
 
-- 对外 API 采用 Go 常见的 `context.Context`、阻塞式 `Next()` 和显式 `Close()`
-- 默认 transport 为本地 `claude` CLI 子进程
-- 重点对齐 Python SDK 0.2.85 的高频能力，并保留 Go 风格的显式类型与错误返回
-- 结构上已经把 transport、控制协议、消息解析、权限回调拆开，后续继续扩展会比较顺
+- Python 的 `receive_response()` 是原生 async iterator；Go 侧提供了对等语义的 `ReceiveResponseStream()`，同时保留了收集型 `ReceiveResponse()`
+- Python 使用 async context manager；Go 使用显式 `Connect()` / `Close()`

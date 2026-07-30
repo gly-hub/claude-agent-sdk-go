@@ -2,7 +2,10 @@ package claudeagentsdk
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"testing"
+	"time"
 )
 
 func TestConvertHookOutputKeywordFields(t *testing.T) {
@@ -26,7 +29,7 @@ func TestConvertHookOutputKeywordFields(t *testing.T) {
 func TestBuildHooksConfigRegistersCallbacks(t *testing.T) {
 	client := NewClient(Options{
 		Hooks: map[string][]HookMatcher{
-			"PreToolUse": {
+			string(HookEventPreToolUse): {
 				{
 					Matcher: "Bash",
 					Timeout: 12.5,
@@ -102,6 +105,80 @@ func TestGetServerInfoReturnsCopy(t *testing.T) {
 	}
 }
 
+func TestTypedControlGetters(t *testing.T) {
+	transport := newFakeTransport()
+	client := NewClientWithTransport(Options{}, transport)
+	go client.readLoop()
+
+	mcpDone := make(chan *MCPStatusResponse, 1)
+	errCh := make(chan error, 2)
+	go func() {
+		resp, err := client.GetMCPStatusResponse(context.Background())
+		if err != nil {
+			errCh <- err
+			return
+		}
+		mcpDone <- resp
+	}()
+	respondToControlRequest(t, transport, map[string]any{
+		"mcpServers": []any{
+			map[string]any{
+				"name":   "fs",
+				"status": "connected",
+				"serverInfo": map[string]any{
+					"name":    "filesystem",
+					"version": "1.0.0",
+				},
+			},
+		},
+	})
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("GetMCPStatusResponse() error = %v", err)
+	case resp := <-mcpDone:
+		if len(resp.MCPServers) != 1 || resp.MCPServers[0].Status != MCPServerStatusConnected {
+			t.Fatalf("unexpected MCP status response: %#v", resp)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for MCP status response")
+	}
+
+	usageDone := make(chan *ContextUsageResponse, 1)
+	go func() {
+		resp, err := client.GetContextUsageResponse(context.Background())
+		if err != nil {
+			errCh <- err
+			return
+		}
+		usageDone <- resp
+	}()
+	respondToControlRequest(t, transport, map[string]any{
+		"categories":           []any{map[string]any{"name": "messages", "tokens": float64(12), "color": "blue"}},
+		"totalTokens":          float64(12),
+		"maxTokens":            float64(100),
+		"rawMaxTokens":         float64(200),
+		"percentage":           12.0,
+		"model":                "claude",
+		"isAutoCompactEnabled": true,
+		"memoryFiles":          []any{},
+		"mcpTools":             []any{},
+		"agents":               []any{},
+		"gridRows":             []any{},
+	})
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("GetContextUsageResponse() error = %v", err)
+	case resp := <-usageDone:
+		if resp.TotalTokens != 12 || len(resp.Categories) != 1 {
+			t.Fatalf("unexpected context usage response: %#v", resp)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for context usage response")
+	}
+}
+
 func TestReceiveResponseStopsAtResult(t *testing.T) {
 	client := NewClient(Options{})
 	client.msgCh <- &AssistantMessage{Content: []ContentBlock{TextBlock{Text: "hi"}}}
@@ -116,5 +193,262 @@ func TestReceiveResponseStopsAtResult(t *testing.T) {
 	}
 	if _, ok := messages[1].(*ResultMessage); !ok {
 		t.Fatalf("expected ResultMessage, got %T", messages[1])
+	}
+}
+
+func TestReceiveResponseStreamStopsAtResult(t *testing.T) {
+	client := NewClient(Options{})
+	client.msgCh <- &AssistantMessage{Content: []ContentBlock{TextBlock{Text: "hi"}}}
+	client.msgCh <- &ResultMessage{Subtype: "success"}
+	client.msgCh <- &AssistantMessage{Content: []ContentBlock{TextBlock{Text: "after"}}}
+
+	var messages []Message
+	for msg := range client.ReceiveResponseStream(context.Background()) {
+		messages = append(messages, msg)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("unexpected message count: %d", len(messages))
+	}
+	if _, ok := messages[1].(*ResultMessage); !ok {
+		t.Fatalf("expected ResultMessage, got %T", messages[1])
+	}
+}
+
+func TestConnectIncludesExcludeDynamicSections(t *testing.T) {
+	transport := newFakeTransport()
+	client := NewClientWithTransport(Options{
+		SystemPromptPreset: &SystemPromptPreset{
+			Preset:                 "claude_code",
+			ExcludeDynamicSections: true,
+		},
+	}, transport)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Connect(context.Background())
+	}()
+
+	var payload map[string]any
+	select {
+	case raw := <-transport.writeCh:
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			t.Fatalf("failed to decode control request: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for initialize request")
+	}
+
+	request := mapFromAny(payload["request"])
+	if request["excludeDynamicSections"] != true {
+		t.Fatalf("expected excludeDynamicSections in initialize request, got %#v", request)
+	}
+
+	transport.messages <- transportMessage{
+		Data: map[string]any{
+			"type": "control_response",
+			"response": map[string]any{
+				"request_id": payload["request_id"],
+				"subtype":    "success",
+				"response":   map[string]any{"ok": true},
+			},
+		},
+	}
+
+	if err := <-done; err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+}
+
+func TestConnectOmitsInitializeSkillsWhenSkillsAll(t *testing.T) {
+	transport := newFakeTransport()
+	client := NewClientWithTransport(Options{
+		Skills: "all",
+	}, transport)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Connect(context.Background())
+	}()
+
+	var payload map[string]any
+	select {
+	case raw := <-transport.writeCh:
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			t.Fatalf("failed to decode control request: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for initialize request")
+	}
+
+	request := mapFromAny(payload["request"])
+	if _, exists := request["skills"]; exists {
+		t.Fatalf("expected skills to be omitted for skills=all, got %#v", request)
+	}
+
+	transport.messages <- transportMessage{
+		Data: map[string]any{
+			"type": "control_response",
+			"response": map[string]any{
+				"request_id": payload["request_id"],
+				"subtype":    "success",
+				"response":   map[string]any{"ok": true},
+			},
+		},
+	}
+
+	if err := <-done; err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+}
+
+func TestConnectIncludesInitializeSkillsWhenSkillsEmptyList(t *testing.T) {
+	transport := newFakeTransport()
+	client := NewClientWithTransport(Options{
+		Skills: []string{},
+	}, transport)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Connect(context.Background())
+	}()
+
+	var payload map[string]any
+	select {
+	case raw := <-transport.writeCh:
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			t.Fatalf("failed to decode control request: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for initialize request")
+	}
+
+	request := mapFromAny(payload["request"])
+	rawSkills, exists := request["skills"]
+	if !exists {
+		t.Fatalf("expected skills field for explicit empty list, got %#v", request)
+	}
+	skills, ok := rawSkills.([]any)
+	if !ok || len(skills) != 0 {
+		t.Fatalf("expected empty skills list, got %#v", rawSkills)
+	}
+
+	transport.messages <- transportMessage{
+		Data: map[string]any{
+			"type": "control_response",
+			"response": map[string]any{
+				"request_id": payload["request_id"],
+				"subtype":    "success",
+				"response":   map[string]any{"ok": true},
+			},
+		},
+	}
+
+	if err := <-done; err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+}
+
+func TestSendControlRequestReturnsProcessErrorBeforeTimeout(t *testing.T) {
+	transport := newFakeTransport()
+	client := NewClientWithTransport(Options{}, transport)
+	go client.readLoop()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.sendControlRequest(context.Background(), map[string]any{"subtype": "initialize"}, time.Hour)
+		done <- err
+	}()
+
+	<-transport.writeCh
+	processErr := &ProcessError{ExitCode: 2, Stderr: "boom"}
+	transport.messages <- transportMessage{Err: processErr}
+
+	select {
+	case err := <-done:
+		var got *ProcessError
+		if !errors.As(err, &got) {
+			t.Fatalf("expected ProcessError, got %T: %v", err, err)
+		}
+		if got.Stderr != "boom" {
+			t.Fatalf("unexpected process error: %#v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("sendControlRequest did not return process error before timeout")
+	}
+}
+
+func TestSendControlRequestReturnsStreamClosedBeforeTimeout(t *testing.T) {
+	transport := newFakeTransport()
+	client := NewClientWithTransport(Options{}, transport)
+	go client.readLoop()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.sendControlRequest(context.Background(), map[string]any{"subtype": "initialize"}, time.Hour)
+		done <- err
+	}()
+
+	<-transport.writeCh
+	close(transport.messages)
+
+	select {
+	case err := <-done:
+		if err == nil || err.Error() != "claude process stream closed before control response" {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("sendControlRequest did not return stream closed before timeout")
+	}
+}
+
+type fakeTransport struct {
+	messages chan transportMessage
+	writeCh  chan []byte
+	ready    bool
+}
+
+func newFakeTransport() *fakeTransport {
+	return &fakeTransport{
+		messages: make(chan transportMessage, 4),
+		writeCh:  make(chan []byte, 4),
+		ready:    true,
+	}
+}
+
+func (t *fakeTransport) Connect(context.Context) error { return nil }
+
+func (t *fakeTransport) Write(_ context.Context, payload []byte) error {
+	t.writeCh <- payload
+	return nil
+}
+
+func (t *fakeTransport) ReadMessages() <-chan transportMessage { return t.messages }
+
+func (t *fakeTransport) Close() error { return nil }
+
+func (t *fakeTransport) EndInput() error { return nil }
+
+func (t *fakeTransport) IsReady() bool { return t.ready }
+
+func respondToControlRequest(t *testing.T, transport *fakeTransport, response map[string]any) {
+	t.Helper()
+	select {
+	case raw := <-transport.writeCh:
+		var payload map[string]any
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			t.Fatalf("failed to decode control request: %v", err)
+		}
+		transport.messages <- transportMessage{
+			Data: map[string]any{
+				"type": "control_response",
+				"response": map[string]any{
+					"request_id": payload["request_id"],
+					"subtype":    "success",
+					"response":   response,
+				},
+			},
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for control request")
 	}
 }
