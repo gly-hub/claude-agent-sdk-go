@@ -172,6 +172,23 @@ func TestBuildCommandAddsNewPythonCompatibleFlags(t *testing.T) {
 	}
 }
 
+func TestBuildCommandPreservesExplicitZeroOptionValues(t *testing.T) {
+	transport := NewSubprocessTransport(Options{
+		MaxTurns:             0,
+		MaxTurnsSet:          true,
+		MaxBudgetUSD:         0,
+		MaxBudgetUSDSet:      true,
+		MaxThinkingTokens:    0,
+		MaxThinkingTokensSet: true,
+		TaskBudget:           &TaskBudget{Total: 0},
+	})
+	cmd := transport.buildCommand("/usr/local/bin/claude")
+	assertFlagValue(t, cmd, "--max-turns", "0")
+	assertFlagValue(t, cmd, "--max-budget-usd", "0")
+	assertFlagValue(t, cmd, "--max-thinking-tokens", "0")
+	assertFlagValue(t, cmd, "--task-budget", "0")
+}
+
 func TestBuildCommandCanUseToolDefaultsPermissionPromptToolToStdio(t *testing.T) {
 	transport := NewSubprocessTransport(Options{
 		CanUseTool: func(req ToolPermissionRequest) (PermissionDecision, error) {

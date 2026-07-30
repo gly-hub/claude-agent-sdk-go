@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -376,47 +377,106 @@ func GetSubagentMessagesFromStore(store SessionStore, sessionID string, agentID 
 
 // ListSessionsFromStore lists sessions maintained by a SessionStore.
 func ListSessionsFromStore(store SessionStore, directory string, limit int, offset int) ([]SessionInfo, error) {
-	listStore, ok := store.(SessionListStore)
-	if !ok {
-		return nil, fmt.Errorf("session store does not implement ListSessions; listing sessions requires SessionListStore")
-	}
 	projectKey, err := ProjectKeyForDirectory(directory)
 	if err != nil {
 		return nil, err
 	}
-	list, err := listStore.ListSessions(projectKey)
-	if err != nil {
-		return nil, err
+	listStore, hasList := store.(SessionListStore)
+	summaryStore, hasSummaries := store.(SessionSummaryStore)
+	if !hasList && !hasSummaries {
+		return nil, fmt.Errorf("session store implements neither ListSessions nor ListSessionSummaries")
 	}
-	infos := make([]SessionInfo, 0, len(list))
-	for _, item := range list {
-		info, err := GetSessionInfoFromStore(store, item.SessionID, directory)
-		if err != nil || info == nil {
+
+	listing := []SessionStoreListEntry{}
+	if hasList {
+		listing, err = listStore.ListSessions(projectKey)
+		if err != nil {
+			return nil, err
+		}
+	}
+	summaries := map[string]SessionStoreSummary{}
+	if hasSummaries {
+		items, summaryErr := summaryStore.ListSessionSummaries(projectKey)
+		if summaryErr == nil {
+			for _, item := range items {
+				summaries[item.SessionID] = item
+			}
+		} else if !hasList {
+			return nil, summaryErr
+		}
+	}
+
+	if !hasList {
+		listing = make([]SessionStoreListEntry, 0, len(summaries))
+		for _, summary := range summaries {
+			listing = append(listing, SessionStoreListEntry{SessionID: summary.SessionID, MTime: summary.LastModified})
+		}
+	}
+	infos := make([]SessionInfo, 0, len(listing))
+	pending := make([]SessionStoreListEntry, 0)
+	for _, item := range listing {
+		if summary, ok := summaries[item.SessionID]; ok && summary.LastModified >= item.MTime {
+			if info := sessionInfoFromSummary(summary, directory); info != nil {
+				info.LastModified = item.MTime
+				infos = append(infos, *info)
+				continue
+			}
+		}
+		pending = append(pending, item)
+	}
+	for _, result := range loadSessionInfos(store, pending, directory) {
+		if result.info != nil {
+			infos = append(infos, *result.info)
 			continue
 		}
-		info.LastModified = item.MTime
-		infos = append(infos, *info)
-	}
-	slices.SortFunc(infos, func(a, b SessionInfo) int {
-		switch {
-		case a.LastModified > b.LastModified:
-			return -1
-		case a.LastModified < b.LastModified:
-			return 1
-		default:
-			return strings.Compare(a.SessionID, b.SessionID)
+		if result.err != nil {
+			// A single remote-store load failure must not hide other sessions.
+			infos = append(infos, SessionInfo{SessionID: result.item.SessionID, LastModified: result.item.MTime})
 		}
-	})
-	if offset > 0 {
-		if offset >= len(infos) {
-			return []SessionInfo{}, nil
+	}
+	return sortAndPaginateSessions(infos, limit, offset), nil
+}
+
+type sessionInfoLoadResult struct {
+	item SessionStoreListEntry
+	info *SessionInfo
+	err  error
+}
+
+func loadSessionInfos(store SessionStore, items []SessionStoreListEntry, directory string) []sessionInfoLoadResult {
+	if len(items) == 0 {
+		return nil
+	}
+	workers := min(16, len(items))
+	jobs := make(chan SessionStoreListEntry)
+	results := make(chan sessionInfoLoadResult, len(items))
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for item := range jobs {
+				info, err := GetSessionInfoFromStore(store, item.SessionID, directory)
+				if info != nil {
+					info.LastModified = item.MTime
+				}
+				results <- sessionInfoLoadResult{item: item, info: info, err: err}
+			}
+		}()
+	}
+	go func() {
+		for _, item := range items {
+			jobs <- item
 		}
-		infos = infos[offset:]
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+	out := make([]sessionInfoLoadResult, 0, len(items))
+	for result := range results {
+		out = append(out, result)
 	}
-	if limit > 0 && limit < len(infos) {
-		infos = infos[:limit]
-	}
-	return infos, nil
+	return out
 }
 
 // GetSessionInfoFromStore returns metadata derived from a stored transcript.
@@ -678,52 +738,39 @@ func appendStoreSessionEntry(store SessionStore, sessionID string, directory str
 }
 
 func sessionInfoFromStoreEntries(entries []SessionStoreEntry, sessionID string, directory string) *SessionInfo {
-	var customTitle, lastPrompt, summary, gitBranch, cwd, tag, firstPrompt string
-	var createdAt int64
 	var fileSize int64
 	for _, entry := range entries {
 		data, _ := json.Marshal(entry)
 		fileSize += int64(len(data) + 1)
-		if custom := stringFromAny(entry["customTitle"]); custom != "" {
-			customTitle = custom
-		}
-		if title := stringFromAny(entry["aiTitle"]); title != "" && customTitle == "" {
-			customTitle = title
-		}
-		if value := stringFromAny(entry["lastPrompt"]); value != "" {
-			lastPrompt = value
-		}
-		if value := stringFromAny(entry["summary"]); value != "" {
-			summary = value
-		}
-		if value := stringFromAny(entry["gitBranch"]); value != "" {
-			gitBranch = value
-		}
-		if value := stringFromAny(entry["cwd"]); value != "" && cwd == "" {
-			cwd = value
-		}
-		if stringFromAny(entry["type"]) == "tag" {
-			tag = stringFromAny(entry["tag"])
-		}
-		if createdAt == 0 {
-			createdAt = parseCreatedAt(stringFromAny(entry["timestamp"]))
-		}
-		if firstPrompt == "" && stringFromAny(entry["type"]) == "user" {
-			message := mapFromAny(entry["message"])
-			prompt := strings.TrimSpace(extractMessageText(message["content"]))
-			if prompt != "" && !skipFirstPromptPattern.MatchString(prompt) {
-				firstPrompt = prompt
-			}
-		}
 	}
-	resolvedSummary := firstNonEmpty(customTitle, lastPrompt, summary, firstPrompt)
-	if resolvedSummary == "" {
+	summary := FoldSessionSummary(nil, SessionKey{SessionID: sessionID}, entries)
+	if summary == nil {
 		return nil
 	}
+	summary.FileSize = fileSize
+	return sessionInfoFromSummary(*summary, directory)
+}
+
+func sessionInfoFromSummary(summary SessionStoreSummary, directory string) *SessionInfo {
+	if boolFromAny(summary.Data["is_sidechain"]) || boolFromAny(summary.Data["isSidechain"]) || summary.Summary == "" {
+		return nil
+	}
+	cwd := summary.CWD
 	if cwd == "" {
 		cwd = directory
 	}
-	return &SessionInfo{SessionID: sessionID, Summary: resolvedSummary, FileSize: fileSize, CustomTitle: customTitle, FirstPrompt: firstPrompt, GitBranch: gitBranch, CWD: cwd, Tag: tag, CreatedAt: createdAt}
+	return &SessionInfo{
+		SessionID:    summary.SessionID,
+		Summary:      summary.Summary,
+		LastModified: summary.LastModified,
+		FileSize:     summary.FileSize,
+		CustomTitle:  summary.CustomTitle,
+		FirstPrompt:  summary.FirstPrompt,
+		GitBranch:    summary.GitBranch,
+		CWD:          cwd,
+		Tag:          summary.Tag,
+		CreatedAt:    summary.CreatedAt,
+	}
 }
 
 func sessionStoreEntriesJSONL(entries []SessionStoreEntry) ([]byte, error) {
@@ -1174,18 +1221,45 @@ func findProjectDirForDirectory(directory string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(getProjectsDir(), key), nil
+	projectsDir := getProjectsDir()
+	exact := filepath.Join(projectsDir, key)
+	if _, err := os.Stat(exact); err == nil || len(key) <= 200 {
+		return exact, nil
+	}
+	prefix := key[:200] + "-"
+	entries, err := os.ReadDir(projectsDir)
+	if err != nil {
+		return exact, nil
+	}
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), prefix) {
+			return filepath.Join(projectsDir, entry.Name()), nil
+		}
+	}
+	return exact, nil
 }
 
 func findSessionFile(sessionID string, directory string) (string, error) {
 	if directory != "" {
-		projectDir, err := findProjectDirForDirectory(directory)
+		canonical, err := canonicalDirectory(directory)
 		if err != nil {
 			return "", err
 		}
-		path := filepath.Join(projectDir, sessionID+".jsonl")
-		if st, err := os.Stat(path); err == nil && st.Size() > 0 {
-			return path, nil
+		candidates := append([]string{canonical}, gitWorktreePaths(canonical)...)
+		seen := map[string]struct{}{}
+		for _, candidate := range candidates {
+			if _, ok := seen[candidate]; ok {
+				continue
+			}
+			seen[candidate] = struct{}{}
+			projectDir, err := findProjectDirForDirectory(candidate)
+			if err != nil {
+				return "", err
+			}
+			path := filepath.Join(projectDir, sessionID+".jsonl")
+			if st, err := os.Stat(path); err == nil && st.Size() > 0 {
+				return path, nil
+			}
 		}
 		return "", nil
 	}

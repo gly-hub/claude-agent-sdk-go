@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
@@ -164,10 +165,21 @@ func (t *SubprocessTransport) Close() error {
 			_ = t.stdin.Close()
 		}
 		if t.cmd != nil && t.cmd.Process != nil {
-			_ = killCommandProcess(t.cmd)
 			if t.processDone != nil {
-				<-t.processDone
-				err = t.getProcessErr()
+				select {
+				case <-t.processDone:
+					err = t.getProcessErr()
+				case <-time.After(5 * time.Second):
+					_ = terminateCommandProcess(t.cmd)
+					select {
+					case <-t.processDone:
+					case <-time.After(5 * time.Second):
+						_ = killCommandProcess(t.cmd)
+						<-t.processDone
+					}
+					// The process was intentionally terminated during shutdown.
+					err = nil
+				}
 			}
 		}
 	})
@@ -199,7 +211,7 @@ func (t *SubprocessTransport) resolveCLIPath(ctx context.Context) (string, error
 	if t.opts.AllowCLIDownload {
 		return t.downloadCLI(ctx)
 	}
-	return "", fmt.Errorf("claude CLI not found; install it, set Options.CLIPath, or enable Options.AllowCLIDownload")
+	return "", &CLINotFoundError{Message: "Claude CLI not found; install it, set Options.CLIPath, or enable Options.AllowCLIDownload"}
 }
 
 func candidateCLIPaths() []string {
@@ -495,13 +507,13 @@ func (t *SubprocessTransport) buildCommand(cliPath string) []string {
 	if len(t.opts.DisallowedTools) > 0 {
 		cmd = append(cmd, "--disallowedTools", strings.Join(t.opts.DisallowedTools, ","))
 	}
-	if t.opts.MaxTurns > 0 {
+	if t.opts.MaxTurnsSet || t.opts.MaxTurns > 0 {
 		cmd = append(cmd, "--max-turns", fmt.Sprintf("%d", t.opts.MaxTurns))
 	}
-	if t.opts.MaxBudgetUSD > 0 {
+	if t.opts.MaxBudgetUSDSet || t.opts.MaxBudgetUSD > 0 {
 		cmd = append(cmd, "--max-budget-usd", fmt.Sprintf("%g", t.opts.MaxBudgetUSD))
 	}
-	if t.opts.TaskBudget != nil && t.opts.TaskBudget.Total > 0 {
+	if t.opts.TaskBudget != nil {
 		cmd = append(cmd, "--task-budget", fmt.Sprintf("%d", t.opts.TaskBudget.Total))
 	}
 	if t.opts.Model != "" {
@@ -596,7 +608,7 @@ func (t *SubprocessTransport) buildCommand(cliPath string) []string {
 		if t.opts.Thinking.Display != "" && t.opts.Thinking.Mode != ThinkingDisabled {
 			cmd = append(cmd, "--thinking-display", string(t.opts.Thinking.Display))
 		}
-	} else if t.opts.MaxThinkingTokens > 0 {
+	} else if t.opts.MaxThinkingTokensSet || t.opts.MaxThinkingTokens > 0 {
 		cmd = append(cmd, "--max-thinking-tokens", fmt.Sprintf("%d", t.opts.MaxThinkingTokens))
 	}
 	if t.opts.Effort != "" {
@@ -914,7 +926,7 @@ func parseNDJSONLine(line []byte) (map[string]any, error) {
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(line, &payload); err != nil {
-		return nil, err
+		return nil, &CLIJSONDecodeError{Line: string(line), Err: err}
 	}
 	return payload, nil
 }

@@ -170,6 +170,10 @@ func TestListSessionsWithOptionsIncludesGitWorktrees(t *testing.T) {
 	if err != nil || len(withWorktrees) != 1 || withWorktrees[0].SessionID != sessionID {
 		t.Fatalf("expected worktree session, got %#v, %v", withWorktrees, err)
 	}
+	info, err := GetSessionInfo(sessionID, repository)
+	if err != nil || info == nil || info.Summary != "worktree prompt" {
+		t.Fatalf("expected worktree session lookup, got %#v, %v", info, err)
+	}
 }
 
 func runGit(t *testing.T, args ...string) {
