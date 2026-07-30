@@ -188,6 +188,20 @@ type DeferredToolUse struct {
 	Input map[string]any
 }
 
+// ModelUsage is the per-model token usage and cost information reported by Claude Code.
+type ModelUsage struct {
+	InputTokens          int     `json:"inputTokens"`
+	OutputTokens         int     `json:"outputTokens"`
+	CacheReadInputTokens int     `json:"cacheReadInputTokens"`
+	CacheCreationTokens  int     `json:"cacheCreationInputTokens"`
+	WebSearchRequests    int     `json:"webSearchRequests"`
+	CostUSD              float64 `json:"costUSD"`
+	ContextWindow        int     `json:"contextWindow"`
+	MaxOutputTokens      int     `json:"maxOutputTokens"`
+	CanonicalModel       string  `json:"canonicalModel,omitempty"`
+	Provider             string  `json:"provider,omitempty"`
+}
+
 type ResultMessage struct {
 	Subtype           string
 	DurationMS        int
@@ -200,12 +214,13 @@ type ResultMessage struct {
 	Usage             map[string]any
 	Result            string
 	StructuredOutput  any
-	ModelUsage        map[string]any
+	ModelUsage        map[string]ModelUsage
 	PermissionDenials []any
 	DeferredToolUse   *DeferredToolUse
 	Errors            []string
 	APIErrorStatus    int
 	UUID              string
+	TerminalReason    string
 }
 
 func (m *ResultMessage) GetType() string { return "result" }

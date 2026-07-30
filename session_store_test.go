@@ -81,3 +81,30 @@ func TestInMemorySessionStoreListSessionSummaries(t *testing.T) {
 		t.Fatalf("unexpected summaries: %#v", summaries)
 	}
 }
+
+func TestSubagentSessionMessagesFromStore(t *testing.T) {
+	store := NewInMemorySessionStore()
+	directory := t.TempDir()
+	projectKey, err := ProjectKeyForDirectory(directory)
+	if err != nil {
+		t.Fatalf("ProjectKeyForDirectory() error = %v", err)
+	}
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	key := SessionKey{ProjectKey: projectKey, SessionID: sessionID, Subpath: "subagents/workflows/run-1/agent-worker-1"}
+	if err := store.Append(key, []SessionStoreEntry{
+		{"type": "agent_metadata"},
+		{"type": "user", "uuid": "11111111-1111-1111-1111-111111111111", "sessionId": sessionID, "message": map[string]any{"content": "delegate"}},
+		{"type": "assistant", "uuid": "22222222-2222-2222-2222-222222222222", "parentUuid": "11111111-1111-1111-1111-111111111111", "sessionId": sessionID, "message": map[string]any{"content": "done"}},
+	}); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+
+	ids, err := ListSubagentsFromStore(store, sessionID, directory)
+	if err != nil || len(ids) != 1 || ids[0] != "worker-1" {
+		t.Fatalf("ListSubagentsFromStore() = %#v, %v", ids, err)
+	}
+	messages, err := GetSubagentMessagesFromStore(store, sessionID, "worker-1", directory, 0, 0)
+	if err != nil || len(messages) != 2 || messages[0].Type != "user" {
+		t.Fatalf("GetSubagentMessagesFromStore() = %#v, %v", messages, err)
+	}
+}

@@ -68,6 +68,12 @@ func (t *SubprocessTransport) Connect(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := validateCLIPath(runtime.GOOS, cliPath); err != nil {
+		return err
+	}
+	if err := validateCLIArguments(runtime.GOOS, t.opts.Resume, t.opts.SessionID); err != nil {
+		return err
+	}
 	if !t.opts.SkipCLIVersionCheck {
 		if err := checkClaudeVersion(ctx, cliPath); err != nil {
 			return err
@@ -223,7 +229,11 @@ func (t *SubprocessTransport) downloadCLI(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("automatic Claude CLI download is not supported on Windows yet; set Options.CLIPath")
 	}
 
-	cliPath, err := t.cachedCLIPath()
+	version, err := validateCLIVersion(t.effectiveCLIVersion())
+	if err != nil {
+		return "", err
+	}
+	cliPath, err := t.cachedCLIPathForVersion(version)
 	if err != nil {
 		return "", err
 	}
@@ -244,7 +254,7 @@ func (t *SubprocessTransport) downloadCLI(ctx context.Context) (string, error) {
 	}
 
 	args := []string{scriptPath}
-	if version := t.effectiveCLIVersion(); version != "latest" {
+	if version != "latest" {
 		args = append(args, version)
 	}
 	cmd := exec.CommandContext(ctx, "bash", args...)
@@ -309,6 +319,14 @@ func (t *SubprocessTransport) downloadInstallScript(ctx context.Context, path st
 }
 
 func (t *SubprocessTransport) cachedCLIPath() (string, error) {
+	version, err := validateCLIVersion(t.effectiveCLIVersion())
+	if err != nil {
+		return "", err
+	}
+	return t.cachedCLIPathForVersion(version)
+}
+
+func (t *SubprocessTransport) cachedCLIPathForVersion(version string) (string, error) {
 	cacheRoot := t.opts.CLICacheDir
 	if cacheRoot == "" {
 		userCache, err := os.UserCacheDir()
@@ -317,9 +335,8 @@ func (t *SubprocessTransport) cachedCLIPath() (string, error) {
 		}
 		cacheRoot = filepath.Join(userCache, "claude-agent-sdk-go", "claude-cli")
 	}
-	version := sanitizePathComponent(t.effectiveCLIVersion())
 	platform := runtime.GOOS + "_" + runtime.GOARCH
-	return filepath.Join(cacheRoot, version, platform, "claude"), nil
+	return filepath.Join(cacheRoot, sanitizePathComponent(version), platform, "claude"), nil
 }
 
 func (t *SubprocessTransport) effectiveCLIVersion() string {
@@ -336,6 +353,39 @@ func sanitizePathComponent(value string) string {
 		return "latest"
 	}
 	return value
+}
+
+var cliVersionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.+-]+)?$`)
+
+func validateCLIVersion(version string) (string, error) {
+	version = strings.TrimSpace(version)
+	if version == "latest" || version == "stable" || cliVersionPattern.MatchString(version) {
+		return version, nil
+	}
+	return "", fmt.Errorf("invalid Claude CLI version %q: expected latest, stable, or a concrete semantic version", version)
+}
+
+func validateCLIPath(goos string, path string) error {
+	if goos != "windows" {
+		return nil
+	}
+	extension := strings.ToLower(filepath.Ext(path))
+	if extension == ".bat" || extension == ".cmd" {
+		return fmt.Errorf("refusing to execute Windows batch CLI %q; use claude.exe or an explicit native executable", path)
+	}
+	return nil
+}
+
+func validateCLIArguments(goos string, resume string, sessionID string) error {
+	if goos != "windows" {
+		return nil
+	}
+	for name, value := range map[string]string{"resume": resume, "session_id": sessionID} {
+		if strings.ContainsAny(value, "&|<>^%!\"\r\n") {
+			return fmt.Errorf("%s contains characters unsafe for Windows command execution", name)
+		}
+	}
+	return nil
 }
 
 func copyFile(src, dst string, mode os.FileMode) error {
@@ -464,10 +514,10 @@ func (t *SubprocessTransport) buildCommand(cliPath string) []string {
 		cmd = append(cmd, "--continue")
 	}
 	if t.opts.Resume != "" {
-		cmd = append(cmd, "--resume", t.opts.Resume)
+		cmd = append(cmd, "--resume="+t.opts.Resume)
 	}
 	if t.opts.SessionID != "" {
-		cmd = append(cmd, "--session-id", t.opts.SessionID)
+		cmd = append(cmd, "--session-id="+t.opts.SessionID)
 	}
 	if settings := t.buildSettingsValue(); settings != "" {
 		cmd = append(cmd, "--settings", settings)
@@ -517,6 +567,10 @@ func (t *SubprocessTransport) buildCommand(cliPath string) []string {
 	for flag, value := range t.opts.ExtraArgs {
 		if value.IsFlag {
 			cmd = append(cmd, "--"+flag)
+			continue
+		}
+		if strings.HasPrefix(value.Value, "-") {
+			cmd = append(cmd, "--"+flag+"="+value.Value)
 			continue
 		}
 		cmd = append(cmd, "--"+flag, value.Value)

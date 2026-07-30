@@ -176,6 +176,233 @@ func GetSessionMessages(sessionID string, directory string, limit int, offset in
 	return records, nil
 }
 
+// ListSubagents returns the IDs of subagent transcripts belonging to a session.
+func ListSubagents(sessionID string, directory string) ([]string, error) {
+	if !isUUID(sessionID) {
+		return []string{}, nil
+	}
+	path, err := findSessionFile(sessionID, directory)
+	if err != nil || path == "" {
+		return []string{}, err
+	}
+	files, err := collectSubagentFiles(filepath.Join(strings.TrimSuffix(path, ".jsonl"), "subagents"))
+	if errors.Is(err, os.ErrNotExist) {
+		return []string{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(files))
+	for _, file := range files {
+		ids = append(ids, file.id)
+	}
+	return ids, nil
+}
+
+// GetSubagentMessages returns the visible user and assistant chain for a subagent.
+func GetSubagentMessages(sessionID string, agentID string, directory string, limit int, offset int) ([]SessionRecord, error) {
+	if !isUUID(sessionID) || agentID == "" {
+		return []SessionRecord{}, nil
+	}
+	path, err := findSessionFile(sessionID, directory)
+	if err != nil || path == "" {
+		return []SessionRecord{}, err
+	}
+	files, err := collectSubagentFiles(filepath.Join(strings.TrimSuffix(path, ".jsonl"), "subagents"))
+	if errors.Is(err, os.ErrNotExist) {
+		return []SessionRecord{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, file := range files {
+		if file.id != agentID {
+			continue
+		}
+		entries, err := readTranscriptEntries(file.path)
+		if err != nil {
+			return nil, err
+		}
+		return subagentRecords(entries, limit, offset), nil
+	}
+	return []SessionRecord{}, nil
+}
+
+// ListSubagentsFromStore returns the IDs of subagent transcripts in a SessionStore.
+func ListSubagentsFromStore(store SessionStore, sessionID string, directory string) ([]string, error) {
+	if !isUUID(sessionID) {
+		return []string{}, nil
+	}
+	projectKey, err := ProjectKeyForDirectory(directory)
+	if err != nil {
+		return nil, err
+	}
+	subkeys, err := store.ListSubkeys(SessionListSubkeysKey{ProjectKey: projectKey, SessionID: sessionID})
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]struct{}{}
+	ids := make([]string, 0)
+	for _, subkey := range subkeys {
+		id := subagentIDFromSubpath(subkey)
+		if id == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+// GetSubagentMessagesFromStore returns the visible user and assistant chain for a stored subagent transcript.
+func GetSubagentMessagesFromStore(store SessionStore, sessionID string, agentID string, directory string, limit int, offset int) ([]SessionRecord, error) {
+	if !isUUID(sessionID) || agentID == "" {
+		return []SessionRecord{}, nil
+	}
+	projectKey, err := ProjectKeyForDirectory(directory)
+	if err != nil {
+		return nil, err
+	}
+	subkeys, err := store.ListSubkeys(SessionListSubkeysKey{ProjectKey: projectKey, SessionID: sessionID})
+	if err != nil {
+		return nil, err
+	}
+	subpath := ""
+	for _, candidate := range subkeys {
+		if subagentIDFromSubpath(candidate) == agentID {
+			subpath = candidate
+			break
+		}
+	}
+	if subpath == "" {
+		return []SessionRecord{}, nil
+	}
+	entries, err := store.Load(SessionKey{ProjectKey: projectKey, SessionID: sessionID, Subpath: subpath})
+	if err != nil {
+		return nil, err
+	}
+	raw := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		if stringFromAny(entry["type"]) != "agent_metadata" {
+			raw = append(raw, entry)
+		}
+	}
+	return subagentRecords(raw, limit, offset), nil
+}
+
+type subagentFile struct {
+	id   string
+	path string
+}
+
+func collectSubagentFiles(baseDir string) ([]subagentFile, error) {
+	entries, err := os.ReadDir(baseDir)
+	if err != nil {
+		return nil, err
+	}
+	files := make([]subagentFile, 0)
+	for _, entry := range entries {
+		path := filepath.Join(baseDir, entry.Name())
+		if entry.IsDir() {
+			nested, err := collectSubagentFiles(path)
+			if err != nil {
+				return nil, err
+			}
+			files = append(files, nested...)
+			continue
+		}
+		if !strings.HasPrefix(entry.Name(), "agent-") || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		files = append(files, subagentFile{
+			id:   strings.TrimSuffix(strings.TrimPrefix(entry.Name(), "agent-"), ".jsonl"),
+			path: path,
+		})
+	}
+	return files, nil
+}
+
+func subagentIDFromSubpath(subpath string) string {
+	if !strings.HasPrefix(subpath, "subagents/") {
+		return ""
+	}
+	name := filepath.Base(subpath)
+	if !strings.HasPrefix(name, "agent-") {
+		return ""
+	}
+	return strings.TrimPrefix(name, "agent-")
+}
+
+func readTranscriptEntries(path string) ([]map[string]any, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 8*1024*1024)
+	entries := make([]map[string]any, 0)
+	for scanner.Scan() {
+		var entry map[string]any
+		if json.Unmarshal(scanner.Bytes(), &entry) == nil {
+			entries = append(entries, entry)
+		}
+	}
+	return entries, scanner.Err()
+}
+
+func subagentRecords(entries []map[string]any, limit int, offset int) []SessionRecord {
+	byUUID := make(map[string]map[string]any, len(entries))
+	var leaf map[string]any
+	for _, entry := range entries {
+		if uuid := stringFromAny(entry["uuid"]); uuid != "" {
+			byUUID[uuid] = entry
+		}
+		typ := stringFromAny(entry["type"])
+		if typ == "user" || typ == "assistant" {
+			leaf = entry
+		}
+	}
+	chain := make([]map[string]any, 0)
+	seen := map[string]struct{}{}
+	for current := leaf; current != nil; {
+		uuid := stringFromAny(current["uuid"])
+		if uuid == "" {
+			break
+		}
+		if _, exists := seen[uuid]; exists {
+			break
+		}
+		seen[uuid] = struct{}{}
+		chain = append(chain, current)
+		current = byUUID[stringFromAny(current["parentUuid"])]
+	}
+	slices.Reverse(chain)
+	records := make([]SessionRecord, 0, len(chain))
+	for _, entry := range chain {
+		records = append(records, SessionRecord{
+			Type:            stringFromAny(entry["type"]),
+			UUID:            stringFromAny(entry["uuid"]),
+			SessionID:       stringFromAny(entry["sessionId"]),
+			Message:         entry["message"],
+			ParentToolUseID: nil,
+		})
+	}
+	if offset > 0 {
+		if offset >= len(records) {
+			return []SessionRecord{}
+		}
+		records = records[offset:]
+	}
+	if limit > 0 && limit < len(records) {
+		records = records[:limit]
+	}
+	return records
+}
+
 func RenameSession(sessionID string, title string, directory string) error {
 	if !isUUID(sessionID) {
 		return fmt.Errorf("invalid session_id: %s", sessionID)
