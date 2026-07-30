@@ -84,6 +84,10 @@ func (t *SubprocessTransport) Connect(ctx context.Context) error {
 
 	cmdArgs := t.buildCommand(cliPath)
 	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
+	configureCommandProcessGroup(cmd)
+	cmd.Cancel = func() error {
+		return killCommandProcess(cmd)
+	}
 	if t.opts.CWD != "" {
 		cmd.Dir = t.opts.CWD
 	}
@@ -160,7 +164,7 @@ func (t *SubprocessTransport) Close() error {
 			_ = t.stdin.Close()
 		}
 		if t.cmd != nil && t.cmd.Process != nil {
-			_ = t.cmd.Process.Kill()
+			_ = killCommandProcess(t.cmd)
 			if t.processDone != nil {
 				<-t.processDone
 				err = t.getProcessErr()

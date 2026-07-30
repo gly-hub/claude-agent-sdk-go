@@ -2,6 +2,7 @@ package claudeagentsdk
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -87,6 +88,94 @@ func TestSessionLifecycle(t *testing.T) {
 
 	if err := DeleteSession(sessionID, projectDir); err != nil {
 		t.Fatalf("DeleteSession() error = %v", err)
+	}
+}
+
+func TestListSessionsWithOptionsListsAllProjectsAndPaginates(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+
+	for _, item := range []struct {
+		directory string
+		sessionID string
+		prompt    string
+	}{
+		{directory: t.TempDir(), sessionID: "11111111-1111-1111-1111-111111111111", prompt: "first"},
+		{directory: t.TempDir(), sessionID: "22222222-2222-2222-2222-222222222222", prompt: "second"},
+	} {
+		projectKey, err := ProjectKeyForDirectory(item.directory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		storageDir := filepath.Join(configDir, "projects", projectKey)
+		if err := os.MkdirAll(storageDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		content := `{"type":"user","uuid":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","sessionId":"` + item.sessionID + `","message":{"content":"` + item.prompt + `"}}` + "\n"
+		if err := os.WriteFile(filepath.Join(storageDir, item.sessionID+".jsonl"), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sessions, err := ListSessionsWithOptions(SessionListOptions{Limit: 1})
+	if err != nil {
+		t.Fatalf("ListSessionsWithOptions() error = %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("expected one paginated global session, got %#v", sessions)
+	}
+	all, err := ListSessionsWithOptions(SessionListOptions{})
+	if err != nil || len(all) != 2 {
+		t.Fatalf("expected two global sessions, got %#v, %v", all, err)
+	}
+	page, err := ListSessionsWithOptions(SessionListOptions{Offset: 1, Limit: 1})
+	if err != nil || len(page) != 1 || page[0].SessionID == sessions[0].SessionID {
+		t.Fatalf("unexpected paginated global sessions: first=%#v page=%#v err=%v", sessions, page, err)
+	}
+}
+
+func TestListSessionsWithOptionsIncludesGitWorktrees(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is required for worktree discovery")
+	}
+	configDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	repository := filepath.Join(t.TempDir(), "repository")
+	runGit(t, "init", repository)
+	runGit(t, "-C", repository, "config", "user.email", "sdk@example.test")
+	runGit(t, "-C", repository, "config", "user.name", "SDK Test")
+	runGit(t, "-C", repository, "commit", "--allow-empty", "-m", "initial")
+	worktree := filepath.Join(t.TempDir(), "worktree")
+	runGit(t, "-C", repository, "worktree", "add", "-b", "sdk-worktree", worktree)
+
+	sessionID := "33333333-3333-3333-3333-333333333333"
+	projectKey, err := ProjectKeyForDirectory(worktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storageDir := filepath.Join(configDir, "projects", projectKey)
+	if err := os.MkdirAll(storageDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := `{"type":"user","uuid":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","sessionId":"` + sessionID + `","message":{"content":"worktree prompt"}}` + "\n"
+	if err := os.WriteFile(filepath.Join(storageDir, sessionID+".jsonl"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	withoutWorktrees, err := ListSessionsWithOptions(SessionListOptions{Directory: repository})
+	if err != nil || len(withoutWorktrees) != 0 {
+		t.Fatalf("expected no worktree sessions when disabled, got %#v, %v", withoutWorktrees, err)
+	}
+	withWorktrees, err := ListSessionsWithOptions(SessionListOptions{Directory: repository, IncludeWorktrees: true})
+	if err != nil || len(withWorktrees) != 1 || withWorktrees[0].SessionID != sessionID {
+		t.Fatalf("expected worktree session, got %#v, %v", withWorktrees, err)
+	}
+}
+
+func runGit(t *testing.T, args ...string) {
+	t.Helper()
+	if output, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
 	}
 }
 
