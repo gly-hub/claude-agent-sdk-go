@@ -209,6 +209,8 @@ type SessionStoreSummary struct {
 	CWD          string
 	Tag          string
 	CreatedAt    int64
+	// Data is SDK-owned opaque state maintained by FoldSessionSummary.
+	Data map[string]any
 }
 
 type SessionListSubkeysKey struct {
@@ -309,6 +311,15 @@ type MCPServerStatus struct {
 	Tools      []MCPToolInfo             `json:"tools,omitempty"`
 }
 
+// MCPClaudeAIProxyServerConfig is the output-only configuration returned for
+// MCP servers proxied through Claude.ai. MCPServerStatus.Config retains the
+// raw wire object so all CLI configuration variants remain representable.
+type MCPClaudeAIProxyServerConfig struct {
+	Type string `json:"type"`
+	URL  string `json:"url"`
+	ID   string `json:"id"`
+}
+
 type MCPStatusResponse struct {
 	MCPServers []MCPServerStatus `json:"mcpServers"`
 }
@@ -373,7 +384,9 @@ type Options struct {
 	AllowedTools            []string
 	DisallowedTools         []string
 	MaxTurns                int
+	MaxTurnsSet             bool
 	MaxBudgetUSD            float64
+	MaxBudgetUSDSet         bool
 	Model                   string
 	FallbackModel           string
 	Betas                   []string
@@ -397,6 +410,7 @@ type Options struct {
 	ExtraArgs               map[string]ExtraArgValue
 	Thinking                *ThinkingConfig
 	MaxThinkingTokens       int
+	MaxThinkingTokensSet    bool
 	Effort                  EffortLevel
 	OutputFormat            *OutputFormat
 	EnableFileCheckpointing bool
@@ -407,7 +421,9 @@ type Options struct {
 	SessionStore            SessionStore
 	SessionStoreFlush       SessionStoreFlushMode
 	LoadTimeoutMS           int
-	Stderr                  func(string)
+	// LoadTimeoutMSSet distinguishes an explicit zero timeout from the default 60 seconds.
+	LoadTimeoutMSSet bool
+	Stderr           func(string)
 	// OnWarning receives non-fatal configuration diagnostics.
 	OnWarning  func(string)
 	CanUseTool CanUseToolFunc

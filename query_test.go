@@ -3,6 +3,7 @@ package claudeagentsdk
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -131,6 +132,39 @@ func TestQueryKeepsInputOpenUntilBackgroundAgentCompletes(t *testing.T) {
 	case <-transport.endInput:
 	case <-time.After(time.Second):
 		t.Fatal("stdin was not closed after the final result")
+	}
+}
+
+func TestQueryStreamWritesEachInputAndEndsInput(t *testing.T) {
+	transport := newFakeTransport()
+	input := make(chan map[string]any, 2)
+	done := make(chan error, 1)
+	go func() {
+		_, err := QueryStreamWithTransport(context.Background(), input, nil, transport)
+		done <- err
+	}()
+	respondToControlRequest(t, transport, map[string]any{})
+	if err := <-done; err != nil {
+		t.Fatalf("QueryStreamWithTransport() error = %v", err)
+	}
+
+	input <- map[string]any{"type": "user", "message": map[string]any{"content": "one"}}
+	input <- map[string]any{"type": "user", "message": map[string]any{"content": "two"}}
+	close(input)
+	for _, want := range []string{"one", "two"} {
+		select {
+		case raw := <-transport.writeCh:
+			if !strings.Contains(string(raw), want) {
+				t.Fatalf("expected input %q, got %s", want, raw)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for input %q", want)
+		}
+	}
+	select {
+	case <-transport.endInput:
+	case <-time.After(time.Second):
+		t.Fatal("expected streamed input to end stdin")
 	}
 }
 

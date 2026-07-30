@@ -42,6 +42,7 @@ func configureCommandProcessGroup(cmd *exec.Cmd) {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.Setpgid = true
+	configureParentDeathSignal(cmd.SysProcAttr)
 }
 
 func killCommandProcess(cmd *exec.Cmd) error {
@@ -52,4 +53,14 @@ func killCommandProcess(cmd *exec.Cmd) error {
 		return nil
 	}
 	return cmd.Process.Kill()
+}
+
+func terminateCommandProcess(cmd *exec.Cmd) error {
+	if cmd == nil || cmd.Process == nil {
+		return os.ErrProcessDone
+	}
+	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM); err == nil {
+		return nil
+	}
+	return cmd.Process.Signal(syscall.SIGTERM)
 }

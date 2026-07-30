@@ -30,6 +30,36 @@ func QueryWithTransport(ctx context.Context, prompt string, opts *Options, trans
 	return queryWithClient(ctx, prompt, resolved, client)
 }
 
+// QueryStream sends a caller-provided sequence of SDK input messages while
+// streaming the corresponding responses. Closing input closes the CLI stdin.
+func QueryStream(ctx context.Context, input <-chan map[string]any, opts *Options) (*MessageStream, error) {
+	return QueryStreamWithTransport(ctx, input, opts, nil)
+}
+
+// QueryStreamWithTransport is QueryStream with an optional custom transport.
+func QueryStreamWithTransport(ctx context.Context, input <-chan map[string]any, opts *Options, transport Transport) (*MessageStream, error) {
+	var resolved Options
+	if opts != nil {
+		resolved = *opts
+	}
+	if transport == nil {
+		transport = NewSubprocessTransport(resolved)
+	}
+	client := NewClientWithTransport(resolved, transport)
+	if err := client.Connect(ctx); err != nil {
+		return nil, err
+	}
+	go func() {
+		for message := range input {
+			if err := client.Send(ctx, message); err != nil {
+				break
+			}
+		}
+		_ = client.EndInput()
+	}()
+	return &MessageStream{client: client}, nil
+}
+
 func queryWithClient(ctx context.Context, prompt string, opts Options, client *Client) (*MessageStream, error) {
 	if err := client.Connect(ctx); err != nil {
 		return nil, err

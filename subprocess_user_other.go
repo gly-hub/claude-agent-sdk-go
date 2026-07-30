@@ -23,3 +23,7 @@ func killCommandProcess(cmd *exec.Cmd) error {
 	}
 	return cmd.Process.Kill()
 }
+
+func terminateCommandProcess(cmd *exec.Cmd) error {
+	return killCommandProcess(cmd)
+}

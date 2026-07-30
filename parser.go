@@ -2,13 +2,12 @@ package claudeagentsdk
 
 import (
 	"encoding/json"
-	"fmt"
 )
 
 func ParseMessage(data map[string]any) (Message, error) {
 	msgType, _ := data["type"].(string)
 	if msgType == "" {
-		return nil, fmt.Errorf("message missing type")
+		return nil, &MessageParseError{Message: "message missing type", Data: data}
 	}
 
 	if msgType == "system" {

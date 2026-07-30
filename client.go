@@ -69,9 +69,6 @@ func (c *Client) Connect(ctx context.Context) error {
 	if warning := canUseToolShadowedWarning(c.opts); warning != "" && c.opts.OnWarning != nil {
 		callWarningCallback(c.opts.OnWarning, warning)
 	}
-	if c.opts.LoadTimeoutMS == 0 {
-		c.opts.LoadTimeoutMS = 60000
-	}
 	if c.opts.SessionStoreFlush == "" {
 		c.opts.SessionStoreFlush = SessionStoreFlushBatched
 	}
@@ -94,6 +91,9 @@ func (c *Client) Connect(ctx context.Context) error {
 		}
 	}
 	if err := c.transport.Connect(ctx); err != nil {
+		if c.materialized != nil {
+			_ = c.materialized.Cleanup()
+		}
 		return err
 	}
 	if c.opts.SessionStore != nil {
@@ -101,7 +101,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		if c.materialized != nil {
 			projectsDir = filepath.Join(c.materialized.ConfigDir, "projects")
 		}
-		c.mirrorBatcher = NewTranscriptMirrorBatcher(c.opts.SessionStore, projectsDir, c.opts.SessionStoreFlush)
+		c.mirrorBatcher = NewTranscriptMirrorBatcherWithError(c.opts.SessionStore, projectsDir, c.opts.SessionStoreFlush, c.reportMirrorError)
 	}
 	go c.readLoop()
 	request := map[string]any{
@@ -121,6 +121,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 	response, err := c.sendControlRequest(ctx, request, 60*time.Second)
 	if err != nil {
+		_ = c.Close()
 		return err
 	}
 	c.serverInfo = response
@@ -190,12 +191,21 @@ func (c *Client) SetPermissionMode(ctx context.Context, mode PermissionMode) err
 }
 
 func (c *Client) SetModel(ctx context.Context, model string) error {
+	return c.SetModelValue(ctx, &model)
+}
+
+// SetModelValue updates the active model. Passing nil restores the CLI default
+// model, matching Python's SetModel(None) behavior.
+func (c *Client) SetModelValue(ctx context.Context, model *string) error {
 	_, err := c.sendControlRequest(ctx, map[string]any{
 		"subtype": "set_model",
 		"model":   model,
 	}, 30*time.Second)
 	return err
 }
+
+// ClearModel restores the CLI default model for the current session.
+func (c *Client) ClearModel(ctx context.Context) error { return c.SetModelValue(ctx, nil) }
 
 func (c *Client) RewindFiles(ctx context.Context, userMessageID string) error {
 	_, err := c.sendControlRequest(ctx, map[string]any{
@@ -366,14 +376,7 @@ func (c *Client) readLoop() {
 						entries = append(entries, SessionStoreEntry(entry))
 					}
 				}
-				if err := c.mirrorBatcher.Enqueue(stringFromAny(item.Data["filePath"]), entries); err != nil {
-					c.failPending(err)
-					select {
-					case c.errCh <- err:
-					default:
-					}
-					return
-				}
+				_ = c.mirrorBatcher.Enqueue(stringFromAny(item.Data["filePath"]), entries)
 			}
 			continue
 		}
@@ -409,6 +412,23 @@ func (c *Client) readLoop() {
 			c.completeQuery()
 		}
 		c.msgCh <- msg
+	}
+}
+
+func (c *Client) reportMirrorError(key *SessionKey, err error) {
+	defer func() {
+		// The read loop may have already closed msgCh while a background flush ends.
+		_ = recover()
+	}()
+	data := map[string]any{"type": "system", "subtype": "mirror_error", "error": err.Error()}
+	if key != nil {
+		data["key"] = *key
+	}
+	message := &MirrorErrorMessage{SystemMessage: SystemMessage{Subtype: "mirror_error", Data: data}, Key: data["key"], Error: err.Error()}
+	select {
+	case <-c.done:
+		return
+	case c.msgCh <- message:
 	}
 }
 
