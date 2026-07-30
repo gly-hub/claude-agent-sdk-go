@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -51,6 +52,15 @@ type ForkResult struct {
 	SessionID string
 }
 
+// SessionListOptions controls local session discovery.
+// An empty Directory searches every project under the Claude config directory.
+type SessionListOptions struct {
+	Directory        string
+	Limit            int
+	Offset           int
+	IncludeWorktrees bool
+}
+
 func ProjectKeyForDirectory(directory string) (string, error) {
 	if directory == "" {
 		directory = "."
@@ -67,22 +77,77 @@ func ProjectKeyForDirectory(directory string) (string, error) {
 }
 
 func ListSessions(directory string) ([]SessionInfo, error) {
-	projectDir, err := findProjectDirForDirectory(directory)
+	return ListSessionsWithOptions(SessionListOptions{Directory: directory, IncludeWorktrees: true})
+}
+
+// ListSessionsWithOptions lists sessions for one project and optionally its git
+// worktrees, or for all projects when Directory is empty.
+func ListSessionsWithOptions(opts SessionListOptions) ([]SessionInfo, error) {
+	if opts.Offset < 0 {
+		return nil, fmt.Errorf("offset cannot be negative: %d", opts.Offset)
+	}
+	if opts.Directory == "" {
+		return listAllSessions(opts.Limit, opts.Offset)
+	}
+
+	canonical, err := canonicalDirectory(opts.Directory)
 	if err != nil {
 		return nil, err
 	}
-	if projectDir == "" {
+	directories := []string{canonical}
+	if opts.IncludeWorktrees {
+		directories = append(directories, gitWorktreePaths(canonical)...)
+	}
+
+	bySessionID := map[string]SessionInfo{}
+	seenDirectories := map[string]struct{}{}
+	for _, directory := range directories {
+		if _, seen := seenDirectories[directory]; seen {
+			continue
+		}
+		seenDirectories[directory] = struct{}{}
+		projectDir, err := findProjectDirForDirectory(directory)
+		if err != nil {
+			return nil, err
+		}
+		for _, info := range readSessionsFromProjectDir(projectDir, directory) {
+			previous, exists := bySessionID[info.SessionID]
+			if !exists || info.LastModified > previous.LastModified {
+				bySessionID[info.SessionID] = info
+			}
+		}
+	}
+	return sortAndPaginateSessions(mapSessionInfos(bySessionID), opts.Limit, opts.Offset), nil
+}
+
+func listAllSessions(limit int, offset int) ([]SessionInfo, error) {
+	entries, err := os.ReadDir(getProjectsDir())
+	if errors.Is(err, os.ErrNotExist) {
 		return []SessionInfo{}, nil
 	}
-
-	entries, err := os.ReadDir(projectDir)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return []SessionInfo{}, nil
-		}
 		return nil, err
 	}
+	bySessionID := map[string]SessionInfo{}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		for _, info := range readSessionsFromProjectDir(filepath.Join(getProjectsDir(), entry.Name()), "") {
+			previous, exists := bySessionID[info.SessionID]
+			if !exists || info.LastModified > previous.LastModified {
+				bySessionID[info.SessionID] = info
+			}
+		}
+	}
+	return sortAndPaginateSessions(mapSessionInfos(bySessionID), limit, offset), nil
+}
 
+func readSessionsFromProjectDir(projectDir string, projectPath string) []SessionInfo {
+	entries, err := os.ReadDir(projectDir)
+	if err != nil {
+		return []SessionInfo{}
+	}
 	results := make([]SessionInfo, 0)
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
@@ -92,13 +157,23 @@ func ListSessions(directory string) ([]SessionInfo, error) {
 		if !isUUID(sessionID) {
 			continue
 		}
-		info, err := parseSessionInfo(filepath.Join(projectDir, entry.Name()), sessionID, directory)
-		if err != nil || info == nil {
-			continue
+		info, err := parseSessionInfo(filepath.Join(projectDir, entry.Name()), sessionID, projectPath)
+		if err == nil && info != nil {
+			results = append(results, *info)
 		}
-		results = append(results, *info)
 	}
+	return results
+}
 
+func mapSessionInfos(bySessionID map[string]SessionInfo) []SessionInfo {
+	results := make([]SessionInfo, 0, len(bySessionID))
+	for _, info := range bySessionID {
+		results = append(results, info)
+	}
+	return results
+}
+
+func sortAndPaginateSessions(results []SessionInfo, limit int, offset int) []SessionInfo {
 	slices.SortFunc(results, func(a, b SessionInfo) int {
 		switch {
 		case a.LastModified > b.LastModified:
@@ -109,7 +184,43 @@ func ListSessions(directory string) ([]SessionInfo, error) {
 			return strings.Compare(a.SessionID, b.SessionID)
 		}
 	})
-	return results, nil
+	if offset >= len(results) {
+		return []SessionInfo{}
+	}
+	if offset > 0 {
+		results = results[offset:]
+	}
+	if limit > 0 && limit < len(results) {
+		results = results[:limit]
+	}
+	return results
+}
+
+func canonicalDirectory(directory string) (string, error) {
+	canonical, err := filepath.EvalSymlinks(directory)
+	if err == nil {
+		return canonical, nil
+	}
+	return filepath.Abs(directory)
+}
+
+func gitWorktreePaths(directory string) []string {
+	output, err := exec.Command("git", "-C", directory, "worktree", "list", "--porcelain").Output()
+	if err != nil {
+		return nil
+	}
+	paths := make([]string, 0)
+	for _, line := range strings.Split(string(output), "\n") {
+		path, ok := strings.CutPrefix(line, "worktree ")
+		if !ok || path == "" {
+			continue
+		}
+		canonical, err := canonicalDirectory(path)
+		if err == nil {
+			paths = append(paths, canonical)
+		}
+	}
+	return paths
 }
 
 func GetSessionInfo(sessionID string, directory string) (*SessionInfo, error) {
