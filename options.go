@@ -219,8 +219,21 @@ type SessionListSubkeysKey struct {
 type SessionStore interface {
 	Append(key SessionKey, entries []SessionStoreEntry) error
 	Load(key SessionKey) ([]SessionStoreEntry, error)
+}
+
+// SessionListStore is an optional SessionStore capability used for listing sessions
+// and resuming the most recent session with ContinueConversation.
+type SessionListStore interface {
 	ListSessions(projectKey string) ([]SessionStoreListEntry, error)
+}
+
+// SessionSubkeyStore is an optional SessionStore capability used for subagent transcripts.
+type SessionSubkeyStore interface {
 	ListSubkeys(key SessionListSubkeysKey) ([]string, error)
+}
+
+// SessionDeleteStore is an optional SessionStore capability for deleting transcripts.
+type SessionDeleteStore interface {
 	Delete(key SessionKey) error
 }
 
@@ -395,5 +408,7 @@ type Options struct {
 	SessionStoreFlush       SessionStoreFlushMode
 	LoadTimeoutMS           int
 	Stderr                  func(string)
-	CanUseTool              CanUseToolFunc
+	// OnWarning receives non-fatal configuration diagnostics.
+	OnWarning  func(string)
+	CanUseTool CanUseToolFunc
 }

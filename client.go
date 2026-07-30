@@ -66,6 +66,9 @@ func (c *Client) Connect(ctx context.Context) error {
 	if err := validatePermissionPromptOptions(c.opts); err != nil {
 		return err
 	}
+	if warning := canUseToolShadowedWarning(c.opts); warning != "" && c.opts.OnWarning != nil {
+		callWarningCallback(c.opts.OnWarning, warning)
+	}
 	if c.opts.LoadTimeoutMS == 0 {
 		c.opts.LoadTimeoutMS = 60000
 	}

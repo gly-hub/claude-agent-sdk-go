@@ -6,6 +6,20 @@ import (
 	"testing"
 )
 
+type appendLoadOnlyStore struct {
+	entries map[string][]SessionStoreEntry
+}
+
+func (s *appendLoadOnlyStore) Append(key SessionKey, entries []SessionStoreEntry) error {
+	storeKey := sessionStoreMapKey(key)
+	s.entries[storeKey] = append(s.entries[storeKey], cloneSessionStoreEntries(entries)...)
+	return nil
+}
+
+func (s *appendLoadOnlyStore) Load(key SessionKey) ([]SessionStoreEntry, error) {
+	return cloneSessionStoreEntries(s.entries[sessionStoreMapKey(key)]), nil
+}
+
 func TestInMemorySessionStoreAndMaterializeResume(t *testing.T) {
 	store := NewInMemorySessionStore()
 	key := SessionKey{ProjectKey: "proj", SessionID: "550e8400-e29b-41d4-a716-446655440000"}
@@ -106,5 +120,73 @@ func TestSubagentSessionMessagesFromStore(t *testing.T) {
 	messages, err := GetSubagentMessagesFromStore(store, sessionID, "worker-1", directory, 0, 0)
 	if err != nil || len(messages) != 2 || messages[0].Type != "user" {
 		t.Fatalf("GetSubagentMessagesFromStore() = %#v, %v", messages, err)
+	}
+}
+
+func TestSessionStoreQueryAndMutationHelpers(t *testing.T) {
+	store := NewInMemorySessionStore()
+	directory := t.TempDir()
+	projectKey, err := ProjectKeyForDirectory(directory)
+	if err != nil {
+		t.Fatalf("ProjectKeyForDirectory() error = %v", err)
+	}
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	key := SessionKey{ProjectKey: projectKey, SessionID: sessionID}
+	if err := store.Append(key, []SessionStoreEntry{
+		{"type": "user", "uuid": "11111111-1111-1111-1111-111111111111", "sessionId": sessionID, "cwd": directory, "timestamp": "2026-07-30T00:00:00Z", "message": map[string]any{"content": "hello"}},
+		{"type": "assistant", "uuid": "22222222-2222-2222-2222-222222222222", "parentUuid": "11111111-1111-1111-1111-111111111111", "sessionId": sessionID, "message": map[string]any{"content": "world"}},
+	}); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+
+	infos, err := ListSessionsFromStore(store, directory, 0, 0)
+	if err != nil || len(infos) != 1 || infos[0].Summary != "hello" {
+		t.Fatalf("ListSessionsFromStore() = %#v, %v", infos, err)
+	}
+	messages, err := GetSessionMessagesFromStore(store, sessionID, directory, 0, 0)
+	if err != nil || len(messages) != 2 || messages[1].Type != "assistant" {
+		t.Fatalf("GetSessionMessagesFromStore() = %#v, %v", messages, err)
+	}
+	if err := RenameSessionViaStore(store, sessionID, "Stored session", directory); err != nil {
+		t.Fatalf("RenameSessionViaStore() error = %v", err)
+	}
+	if err := TagSessionViaStore(store, sessionID, "demo", directory); err != nil {
+		t.Fatalf("TagSessionViaStore() error = %v", err)
+	}
+	info, err := GetSessionInfoFromStore(store, sessionID, directory)
+	if err != nil || info == nil || info.CustomTitle != "Stored session" || info.Tag != "demo" {
+		t.Fatalf("GetSessionInfoFromStore() = %#v, %v", info, err)
+	}
+	fork, err := ForkSessionViaStore(store, sessionID, directory, "", "")
+	if err != nil || !isUUID(fork.SessionID) {
+		t.Fatalf("ForkSessionViaStore() = %#v, %v", fork, err)
+	}
+	if err := DeleteSessionViaStore(store, sessionID, directory); err != nil {
+		t.Fatalf("DeleteSessionViaStore() error = %v", err)
+	}
+	entries, err := store.Load(key)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("expected deleted store session, got %#v, %v", entries, err)
+	}
+}
+
+func TestMinimalSessionStoreSupportsResumeButNotContinue(t *testing.T) {
+	directory := t.TempDir()
+	projectKey, err := ProjectKeyForDirectory(directory)
+	if err != nil {
+		t.Fatalf("ProjectKeyForDirectory() error = %v", err)
+	}
+	sessionID := "550e8400-e29b-41d4-a716-446655440000"
+	store := &appendLoadOnlyStore{entries: map[string][]SessionStoreEntry{}}
+	if err := store.Append(SessionKey{ProjectKey: projectKey, SessionID: sessionID}, []SessionStoreEntry{{"type": "user", "uuid": "11111111-1111-1111-1111-111111111111"}}); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	materialized, err := MaterializeResumeSession(Options{CWD: directory, SessionStore: store, Resume: sessionID})
+	if err != nil || materialized == nil {
+		t.Fatalf("MaterializeResumeSession() = %#v, %v", materialized, err)
+	}
+	defer materialized.Cleanup()
+	if _, err := MaterializeResumeSession(Options{CWD: directory, SessionStore: store, ContinueConversation: true}); err == nil {
+		t.Fatal("expected ContinueConversation to require SessionListStore")
 	}
 }
